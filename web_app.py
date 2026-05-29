@@ -8,7 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from main import available_devices, run_asr, warmup_asr_model
+from main import available_devices, device_choices, run_asr, warmup_asr_model
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +28,7 @@ class WebAsrHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_path = urlparse(self.path)
         if parsed_path.path == "/api/devices":
-            self.write_json({"devices": safe_available_devices()})
+            self.write_json(safe_device_payload())
             return
         super().do_GET()
 
@@ -50,7 +50,7 @@ class WebAsrHandler(SimpleHTTPRequestHandler):
             model = fields.get("model", "").strip()
             if not model:
                 raise ValueError("Model path is required.")
-            result = warmup_asr_model(Path(model), fields.get("device", "auto"))
+            result = warmup_asr_model(model, fields.get("device", "auto"))
             self.write_json(result)
         except SystemExit as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -137,11 +137,14 @@ def parse_content_disposition(value: str) -> dict[str, str]:
     return items
 
 
-def safe_available_devices() -> list[str]:
+def safe_device_payload() -> dict:
     try:
-        return available_devices()
+        return {
+            "devices": available_devices(),
+            "choices": device_choices(),
+        }
     except SystemExit:
-        return []
+        return {"devices": [], "choices": []}
 
 
 def transcribe_form(
@@ -164,17 +167,14 @@ def transcribe_form(
     try:
         args = argparse.Namespace(
             device=fields.get("device", "auto"),
-            model=Path(model),
+            model=model,
             audio=temp_audio_path,
             mic=False,
             duration=float(fields.get("duration", "0") or "0"),
             input_device=None,
             benchmark=True,
             json=True,
-            language=fields.get("language") or None,
-            task=fields.get("task", "transcribe"),
             max_new_tokens=int(fields.get("max_new_tokens", "128") or "128"),
-            timestamps=fields.get("timestamps") == "true",
         )
         payload, _benchmark = run_asr(args)
         return payload

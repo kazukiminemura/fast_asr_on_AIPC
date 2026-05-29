@@ -40,12 +40,32 @@ async function loadDevices() {
   try {
     const response = await fetch("/api/devices");
     const data = await response.json();
+    updateDeviceSelect(data.choices || []);
     els.deviceStatus.textContent = data.devices?.length
-      ? `OpenVINO: ${data.devices.join(", ")}`
-      : "OpenVINO devices unavailable";
+      ? `Transformers: ${data.devices.join(", ")}`
+      : "Moonshine devices unavailable";
   } catch {
     els.deviceStatus.textContent = "device check failed";
   }
+}
+
+function updateDeviceSelect(choices) {
+  const deviceSelect = document.querySelector("#device");
+  const currentValue = deviceSelect.value || "auto";
+  deviceSelect.innerHTML = "";
+
+  for (const choice of choices) {
+    const option = document.createElement("option");
+    option.value = choice.value;
+    option.textContent = choice.available ? choice.label : `${choice.label} unavailable`;
+    option.disabled = !choice.available;
+    deviceSelect.appendChild(option);
+  }
+
+  const hasCurrentValue = [...deviceSelect.options].some(
+    (option) => option.value === currentValue && !option.disabled,
+  );
+  deviceSelect.value = hasCurrentValue ? currentValue : "auto";
 }
 
 async function startLive() {
@@ -114,16 +134,20 @@ async function warmupModel() {
 
   state.warmed = true;
   els.warmupNotice.textContent = data.cache_hit
-    ? `Warm cache ready on ${data.selected_device}. OpenVINO cache: ${data.cache_dir}`
-    : `Warmup complete on ${data.selected_device} in ${formatNumber(data.model_load_seconds)}s. OpenVINO cache saved to ${data.cache_dir}`;
+    ? `Warm cache ready on ${formatWarmupDevice(data)}. Cache: ${data.cache_dir}`
+    : `Warmup complete on ${formatWarmupDevice(data)} in ${formatNumber(data.model_load_seconds)}s. Cache saved to ${data.cache_dir}`;
   els.liveLog.textContent = "warmup complete";
+}
+
+function formatWarmupDevice(data) {
+  return data.fallback_device ? `${data.selected_device} + ${data.fallback_device} fallback` : data.selected_device;
 }
 
 function resetWarmup() {
   state.warmed = false;
   els.warmupNotice.classList.remove("active");
   els.warmupNotice.textContent =
-    "The first start warms up the Whisper model and OpenVINO device cache. It can take a while. Later starts reuse the in-memory pipeline, and OpenVINO cache files remain under cache\\openvino for faster startup after restart.";
+    "The first start downloads and warms up UsefulSensors/moonshine-tiny-ja. Intel GPU uses OpenVINO and saves converted model files under cache\\openvino for faster startup after restart.";
 }
 
 async function stopLive() {
@@ -215,11 +239,8 @@ function buildFormData() {
   const formData = new FormData();
   formData.append("model", document.querySelector("#model").value.trim());
   formData.append("device", document.querySelector("#device").value);
-  formData.append("language", document.querySelector("#language").value);
-  formData.append("task", document.querySelector("#task").value);
   formData.append("max_new_tokens", document.querySelector("#maxTokens").value);
   formData.append("duration", document.querySelector("#duration").value);
-  formData.append("timestamps", document.querySelector("#timestamps").checked ? "true" : "false");
   return formData;
 }
 
@@ -237,7 +258,7 @@ function renderMetrics(data, label) {
   const benchmark = data.benchmark || {};
   els.metrics.innerHTML = [
     metric("source", label),
-    metric("device", data.selected_device),
+    metric("device", data.fallback_device ? `${data.selected_device} + ${data.fallback_device}` : data.selected_device),
     metric("audio sec", formatNumber(benchmark.audio_duration_seconds)),
     metric("rtf", benchmark.rtf == null ? "n/a" : formatNumber(benchmark.rtf)),
     metric("load sec", formatNumber(benchmark.model_load_seconds)),

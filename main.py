@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 import time
@@ -9,15 +10,16 @@ from pathlib import Path
 from typing import Any
 
 
-DEVICE_PRIORITY = ("GPU", "NPU", "CPU")
+DEFAULT_MODEL = "UsefulSensors/moonshine-tiny-ja"
+HF_CACHE_DIR = Path("cache") / "huggingface"
+OPENVINO_CACHE_DIR = Path("cache") / "openvino"
 DEVICE_ALIASES = {
     "auto": "AUTO",
-    "gpu": "GPU",
-    "npu": "NPU",
+    "intel_gpu": "OPENVINO_GPU",
+    "gpu": "CUDA",
     "cpu": "CPU",
 }
-PIPELINE_CACHE: dict[tuple[str, str], Any] = {}
-OPENVINO_CACHE_DIR = Path("cache") / "openvino"
+RUNNER_CACHE: dict[tuple[str, str], Any] = {}
 
 
 @dataclass
@@ -31,21 +33,127 @@ class BenchmarkResult:
     rtf: float | None
 
 
+class MoonshineRunner:
+    def __init__(self, model_ref: str, device: str) -> None:
+        torch = require_dependency("torch", "torch")
+        transformers = require_dependency("transformers", "transformers")
+
+        self.torch = torch
+        self.device_name = device
+        self.torch_device = "cuda:0" if device == "CUDA" else "cpu"
+        self.torch_dtype = torch.float16 if device == "CUDA" else torch.float32
+        self.processor = transformers.AutoProcessor.from_pretrained(
+            model_ref,
+            cache_dir=str(HF_CACHE_DIR),
+        )
+        self.model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_ref,
+            cache_dir=str(HF_CACHE_DIR),
+        )
+        self.model.to(self.torch_device)
+        self.model.to(self.torch_dtype)
+        self.model.eval()
+
+    def transcribe(self, raw_speech: list[float], max_tokens: int) -> str:
+        sampling_rate = self.processor.feature_extractor.sampling_rate
+        inputs = self.processor(
+            raw_speech,
+            return_tensors="pt",
+            sampling_rate=sampling_rate,
+        )
+        inputs = inputs.to(self.torch_device)
+        if "input_values" in inputs:
+            inputs["input_values"] = inputs["input_values"].to(self.torch_dtype)
+
+        max_length = max(1, max_tokens)
+        if "attention_mask" in inputs:
+            token_limit_factor = 13 / sampling_rate
+            seq_lens = inputs["attention_mask"].sum(dim=-1)
+            estimated_limit = int((seq_lens * token_limit_factor).max().item())
+            max_length = max(1, min(max_tokens, estimated_limit))
+
+        with self.torch.inference_mode():
+            generated_ids = self.model.generate(**inputs, max_length=max_length)
+        return self.processor.decode(generated_ids[0], skip_special_tokens=True).strip()
+
+
+class OpenVINOMoonshineRunner:
+    def __init__(self, model_ref: str, device: str) -> None:
+        optimum_intel = require_dependency("optimum.intel", "optimum-intel[openvino]")
+        openvino_export = require_dependency("optimum.exporters.openvino", "optimum-intel[openvino]")
+        transformers = require_dependency("transformers", "transformers")
+
+        ov_model_dir = OPENVINO_CACHE_DIR / sanitize_model_ref(model_ref)
+        ov_config = {"CACHE_DIR": str(OPENVINO_CACHE_DIR / "compiled")}
+        self.device_name = device
+        self.processor = transformers.AutoProcessor.from_pretrained(
+            model_ref,
+            cache_dir=str(HF_CACHE_DIR),
+        )
+
+        has_openvino_model = ov_model_dir.exists() and any(ov_model_dir.glob("*.xml"))
+        if has_openvino_model:
+            self.model = optimum_intel.OVModelForSpeechSeq2Seq.from_pretrained(
+                ov_model_dir,
+                device=device,
+                ov_config=ov_config,
+            )
+        else:
+            ov_model_dir.mkdir(parents=True, exist_ok=True)
+            openvino_export.main_export(
+                model_name_or_path=model_ref,
+                output=ov_model_dir,
+                task="automatic-speech-recognition",
+                cache_dir=str(HF_CACHE_DIR),
+                library_name="transformers",
+                stateful=True,
+            )
+            self.model = optimum_intel.OVModelForSpeechSeq2Seq.from_pretrained(
+                ov_model_dir,
+                device=device,
+                ov_config=ov_config,
+            )
+            self.processor.save_pretrained(ov_model_dir)
+        self.model.main_input_name = "input_values"
+        self.model.encoder.main_input_name = "input_values"
+
+    def transcribe(self, raw_speech: list[float], max_tokens: int) -> str:
+        sampling_rate = self.processor.feature_extractor.sampling_rate
+        inputs = self.processor(
+            raw_speech,
+            return_tensors="pt",
+            sampling_rate=sampling_rate,
+        )
+
+        max_length = max(1, max_tokens)
+        if "attention_mask" in inputs:
+            token_limit_factor = 13 / sampling_rate
+            seq_lens = inputs["attention_mask"].sum(dim=-1)
+            estimated_limit = int((seq_lens * token_limit_factor).max().item())
+            max_length = max(1, min(max_tokens, estimated_limit))
+
+        generated_ids = self.model.generate(
+            inputs=inputs["input_values"],
+            attention_mask=inputs.get("attention_mask"),
+            max_length=max_length,
+        )
+        return self.processor.decode(generated_ids[0], skip_special_tokens=True).strip()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Whisper ASR with OpenVINO GenAI on GPU, NPU, or CPU.",
+        description="Run Moonshine ASR with UsefulSensors/moonshine-tiny-ja.",
     )
     parser.add_argument(
         "--device",
         choices=tuple(DEVICE_ALIASES),
         default="auto",
-        help="Inference device. auto prefers GPU, then NPU, then CPU.",
+        help="Inference device. auto prefers Intel GPU, then CUDA, then CPU.",
     )
     parser.add_argument(
         "--model",
-        required=True,
-        type=Path,
-        help="Path to an OpenVINO GenAI Whisper model directory.",
+        default=DEFAULT_MODEL,
+        help="Hugging Face model id or local model directory.",
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
@@ -79,32 +187,17 @@ def parse_args() -> argparse.Namespace:
         help="Print machine-readable JSON output.",
     )
     parser.add_argument(
-        "--language",
-        help='Optional Whisper language token, for example "<|en|>" or "<|ja|>".',
-    )
-    parser.add_argument(
-        "--task",
-        choices=("transcribe", "translate"),
-        default="transcribe",
-        help="Whisper task.",
-    )
-    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=128,
         help="Maximum number of generated tokens.",
-    )
-    parser.add_argument(
-        "--timestamps",
-        action="store_true",
-        help="Return sentence-level timestamps when supported by the model.",
     )
     return parser.parse_args()
 
 
 def require_dependency(module_name: str, package_name: str) -> Any:
     try:
-        return __import__(module_name)
+        return importlib.import_module(module_name)
     except ImportError as exc:
         raise SystemExit(
             f"Missing dependency: {package_name}. Install dependencies with "
@@ -113,35 +206,73 @@ def require_dependency(module_name: str, package_name: str) -> Any:
 
 
 def available_devices() -> list[str]:
-    openvino = require_dependency("openvino", "openvino")
-    core = openvino.Core()
-    return list(core.available_devices)
+    torch = require_dependency("torch", "torch")
+    devices = ["CPU"]
+    try:
+        openvino = require_dependency("openvino", "openvino")
+        core = openvino.Core()
+        if "GPU" in core.available_devices:
+            devices.insert(0, "OPENVINO_GPU")
+    except SystemExit:
+        pass
+    if torch.cuda.is_available():
+        insert_at = 1 if "OPENVINO_GPU" in devices else 0
+        devices.insert(insert_at, "CUDA")
+    return devices
+
+
+def device_choices() -> list[dict[str, Any]]:
+    devices = available_devices()
+    auto_target = "OPENVINO_GPU" if "OPENVINO_GPU" in devices else "CUDA" if "CUDA" in devices else "CPU"
+    return [
+        {
+            "value": "auto",
+            "label": f"auto ({auto_target})",
+            "available": True,
+            "target": auto_target,
+        },
+        {
+            "value": "intel_gpu",
+            "label": "Intel GPU (OpenVINO)",
+            "available": "OPENVINO_GPU" in devices,
+            "target": "OPENVINO_GPU",
+        },
+        {
+            "value": "cpu",
+            "label": "CPU",
+            "available": "CPU" in devices,
+            "target": "CPU",
+        },
+        {
+            "value": "gpu",
+            "label": "GPU (CUDA)",
+            "available": "CUDA" in devices,
+            "target": "CUDA",
+        },
+    ]
 
 
 def select_device(requested: str, devices: list[str]) -> str:
     requested_device = DEVICE_ALIASES[requested]
-    if requested_device != "AUTO":
-        if requested_device not in devices:
-            available = ", ".join(devices) or "none"
-            raise SystemExit(
-                f"Requested device {requested_device} is not available. "
-                f"Available devices: {available}"
-            )
-        return requested_device
-
-    for device in DEVICE_PRIORITY:
-        if device in devices:
-            return device
-
-    available = ", ".join(devices) or "none"
-    raise SystemExit(f"No supported OpenVINO device found. Available devices: {available}")
+    if requested_device == "AUTO":
+        if "OPENVINO_GPU" in devices:
+            return "OPENVINO_GPU"
+        return "CUDA" if "CUDA" in devices else "CPU"
+    if requested_device not in devices:
+        available = ", ".join(devices) or "none"
+        raise SystemExit(
+            f"Requested device {requested_device} is not available for the "
+            f"Transformers Moonshine backend. Available devices: {available}"
+        )
+    return requested_device
 
 
-def validate_paths(model_path: Path, audio_path: Path | None) -> None:
-    if not model_path.exists():
-        raise SystemExit(f"Model path does not exist: {model_path}")
-    if not model_path.is_dir():
-        raise SystemExit(f"Model path must be an OpenVINO GenAI model directory: {model_path}")
+def validate_inputs(model_ref: str, audio_path: Path | None) -> None:
+    if not model_ref.strip():
+        raise SystemExit("Model id or path is required.")
+    model_path = Path(model_ref)
+    if model_path.exists() and not model_path.is_dir():
+        raise SystemExit(f"Local model path must be a directory: {model_path}")
     if audio_path is None:
         return
     if not audio_path.exists():
@@ -180,84 +311,56 @@ def read_microphone_16khz(duration_seconds: float, input_device: str | None) -> 
     return recording.reshape(-1).tolist(), duration_seconds
 
 
-def build_generation_kwargs(args: argparse.Namespace) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "max_new_tokens": args.max_new_tokens,
-        "task": args.task,
-    }
-    if args.language:
-        kwargs["language"] = args.language
-    if args.timestamps:
-        kwargs["return_timestamps"] = True
-    return kwargs
+def sanitize_model_ref(model_ref: str) -> str:
+    return "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in model_ref)
 
 
-def extract_text(result: Any) -> str:
-    if hasattr(result, "texts") and result.texts:
-        return str(result.texts[0]).strip()
-    if hasattr(result, "text"):
-        return str(result.text).strip()
-    return str(result).strip()
+def get_moonshine_runner(model_ref: str, device: str) -> tuple[Any, float]:
+    cache_key = (model_ref, device)
+    if cache_key in RUNNER_CACHE:
+        return RUNNER_CACHE[cache_key], 0.0
 
-
-def extract_chunks(result: Any) -> list[dict[str, Any]]:
-    chunks = []
-    for chunk in getattr(result, "chunks", []) or []:
-        chunks.append(
-            {
-                "start": getattr(chunk, "start_ts", None),
-                "end": getattr(chunk, "end_ts", None),
-                "text": getattr(chunk, "text", ""),
-            }
-        )
-    return chunks
-
-
-def get_whisper_pipeline(model_path: Path, device: str) -> tuple[Any, float]:
-    cache_key = (str(model_path.resolve()), device)
-    if cache_key in PIPELINE_CACHE:
-        return PIPELINE_CACHE[cache_key], 0.0
-
-    ov_genai = require_dependency("openvino_genai", "openvino-genai")
+    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     OPENVINO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     load_start = time.perf_counter()
-    try:
-        pipe = ov_genai.WhisperPipeline(
-            str(model_path),
-            device,
-            CACHE_DIR=str(OPENVINO_CACHE_DIR),
-        )
-    except TypeError:
-        pipe = ov_genai.WhisperPipeline(str(model_path), device)
+    if device == "OPENVINO_GPU":
+        runner = OpenVINOMoonshineRunner(model_ref, "GPU")
+    else:
+        runner = MoonshineRunner(model_ref, device)
     load_seconds = time.perf_counter() - load_start
-    PIPELINE_CACHE[cache_key] = pipe
-    return pipe, load_seconds
+    RUNNER_CACHE[cache_key] = runner
+    return runner, load_seconds
 
 
-def warmup_asr_model(model_path: Path, requested_device: str) -> dict[str, Any]:
-    validate_paths(model_path, None)
+def warmup_asr_model(model_ref: str, requested_device: str) -> dict[str, Any]:
+    validate_inputs(model_ref, None)
     devices = available_devices()
     selected_device = select_device(requested_device, devices)
-    _pipe, model_load_seconds = get_whisper_pipeline(model_path, selected_device)
+    _runner, model_load_seconds = get_moonshine_runner(model_ref, selected_device)
+    fallback_load_seconds = 0.0
+    if selected_device == "OPENVINO_GPU":
+        _fallback_runner, fallback_load_seconds = get_moonshine_runner(model_ref, "CPU")
     return {
+        "model": model_ref,
         "requested_device": requested_device,
         "selected_device": selected_device,
         "available_devices": devices,
-        "model_load_seconds": model_load_seconds,
-        "cache_hit": model_load_seconds == 0.0,
-        "cache_dir": str(OPENVINO_CACHE_DIR),
+        "model_load_seconds": model_load_seconds + fallback_load_seconds,
+        "cache_hit": model_load_seconds == 0.0 and fallback_load_seconds == 0.0,
+        "cache_dir": str(OPENVINO_CACHE_DIR if selected_device == "OPENVINO_GPU" else HF_CACHE_DIR),
+        "fallback_device": "CPU" if selected_device == "OPENVINO_GPU" else None,
     }
 
 
 def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
-    validate_paths(args.model, args.audio)
+    validate_inputs(args.model, args.audio)
 
     device_start = time.perf_counter()
     devices = available_devices()
     selected_device = select_device(args.device, devices)
     device_selection_seconds = time.perf_counter() - device_start
 
-    pipe, model_load_seconds = get_whisper_pipeline(args.model, selected_device)
+    runner, model_load_seconds = get_moonshine_runner(args.model, selected_device)
 
     preprocess_start = time.perf_counter()
     if args.mic:
@@ -269,12 +372,17 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     audio_preprocess_seconds = time.perf_counter() - preprocess_start
 
     inference_start = time.perf_counter()
-    result = pipe.generate(raw_speech, **build_generation_kwargs(args))
+    text = runner.transcribe(raw_speech, args.max_new_tokens)
+    fallback_device = None
+    if selected_device == "OPENVINO_GPU" and not text and audio_rms(raw_speech) > 0.001:
+        fallback_runner, fallback_load_seconds = get_moonshine_runner(args.model, "CPU")
+        model_load_seconds += fallback_load_seconds
+        text = fallback_runner.transcribe(raw_speech, args.max_new_tokens)
+        fallback_device = "CPU"
     inference_seconds = time.perf_counter() - inference_start
 
     postprocess_start = time.perf_counter()
-    text = extract_text(result)
-    chunks = extract_chunks(result)
+    text = text.strip()
     postprocess_seconds = time.perf_counter() - postprocess_start
 
     total_seconds = (
@@ -298,9 +406,11 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
 
     payload = {
         "text": text,
-        "chunks": chunks,
+        "chunks": [],
+        "model": args.model,
         "requested_device": args.device,
         "selected_device": selected_device,
+        "fallback_device": fallback_device,
         "available_devices": devices,
         "input_source": input_source,
         "benchmark": asdict(benchmark),
@@ -308,23 +418,23 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     return payload, benchmark
 
 
+def audio_rms(raw_speech: list[float]) -> float:
+    if not raw_speech:
+        return 0.0
+    square_sum = sum(sample * sample for sample in raw_speech)
+    return (square_sum / len(raw_speech)) ** 0.5
+
+
 def print_human_output(payload: dict[str, Any], show_benchmark: bool) -> None:
     print(payload["text"])
-
-    if payload["chunks"]:
-        print()
-        for chunk in payload["chunks"]:
-            start = chunk["start"]
-            end = chunk["end"]
-            if start is None or end is None:
-                print(chunk["text"])
-            else:
-                print(f"[{start:.2f} - {end:.2f}] {chunk['text']}")
 
     if show_benchmark:
         benchmark = payload["benchmark"]
         print()
+        print(f"model: {payload['model']}")
         print(f"selected_device: {payload['selected_device']}")
+        if payload.get("fallback_device"):
+            print(f"fallback_device: {payload['fallback_device']}")
         print(f"available_devices: {', '.join(payload['available_devices'])}")
         print(f"model_load_seconds: {benchmark['model_load_seconds']:.4f}")
         print(f"audio_preprocess_seconds: {benchmark['audio_preprocess_seconds']:.4f}")
