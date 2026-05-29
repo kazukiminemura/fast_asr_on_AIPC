@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AIPC ASR</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="control-panel">
+        <div class="brand">
+          <div>
+            <h1>AIPC ASR</h1>
+            <p>OpenVINO GenAI Whisper</p>
+          </div>
+          <span id="deviceStatus" class="status">checking devices</span>
+        </div>
+
+        <form id="asrForm" class="form-grid">
+          <label class="field wide">
+            <span>Model directory</span>
+            <input
+              id="model"
+              name="model"
+              type="text"
+              value="models\whisper-base"
+              autocomplete="off"
+              required
+            />
+          </label>
+
+          <label class="field">
+            <span>Device</span>
+            <select id="device" name="device">
+              <option value="auto">auto</option>
+              <option value="gpu">gpu</option>
+              <option value="npu">npu</option>
+              <option value="cpu">cpu</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Language</span>
+            <select id="language" name="language">
+              <option value="">auto</option>
+              <option value="<|ja|>">Japanese</option>
+              <option value="<|en|>">English</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Task</span>
+            <select id="task" name="task">
+              <option value="transcribe">transcribe</option>
+              <option value="translate">translate</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Max tokens</span>
+            <input id="maxTokens" name="max_new_tokens" type="number" value="128" min="8" max="1024" />
+          </label>
+
+          <label class="field">
+            <span>Chunk seconds</span>
+            <input id="duration" name="duration" type="number" value="4" min="1" max="30" step="1" />
+          </label>
+
+          <label class="toggle">
+            <input id="timestamps" name="timestamps" type="checkbox" />
+            <span>timestamps</span>
+          </label>
+        </form>
+      </section>
+
+      <section class="workspace">
+        <div class="input-pane">
+          <div class="source-title">Live microphone</div>
+          <div id="warmupNotice" class="warmup-notice">
+            The first start warms up the Whisper model and OpenVINO device cache. It can take a while.
+            Later starts reuse the in-memory pipeline, and OpenVINO cache files remain under cache\openvino for faster startup after restart.
+          </div>
+
+          <div id="micPane" class="pane active">
+            <div class="meter">
+              <div id="meterBar"></div>
+            </div>
+            <div class="button-row">
+              <button id="startLiveButton" class="primary" type="button">Start Live</button>
+              <button id="stopLiveButton" type="button" disabled>Stop</button>
+              <button id="clearButton" type="button">Clear</button>
+            </div>
+            <div id="liveLog" class="live-log">waiting</div>
+          </div>
+        </div>
+
+        <div class="output-pane">
+          <div class="output-header">
+            <h2>Transcript</h2>
+            <span id="runStatus">idle</span>
+          </div>
+          <pre id="transcript"></pre>
+          <div id="metrics" class="metrics"></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
