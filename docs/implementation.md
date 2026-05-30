@@ -1,43 +1,38 @@
-# fast_asr_on_AIPC 実装ガイド
+# fast_asr_on_AIPC Implementation Guide
 
-このドキュメントは、`fast_asr_on_AIPC` を同じ仕様で再実装できるように、現行実装の構成、責務、処理フロー、API、キャッシュ、デバイス選択をまとめたものです。
+This document describes the current implementation so the app can be maintained or rebuilt from the same design.
 
-## 目的
+## Goal
 
-AIPC 上で日本語音声認識を低遅延に試せる、ブラウザ GUI 付きのローカル ASR アプリを作る。
+Provide a local browser GUI for low-latency Japanese ASR on an AIPC.
 
-- ブラウザでマイク音声を録音する
-- 音声を発話と無音に合わせた動的チャンクに分割してサーバーへ送る
-- サーバー側で日本語向け Qwen3-ASR を実行する
-- Intel NPU/GPU がある場合は OpenVINO を優先する
-- 認識結果と RTF をチャンクごとに画面へ追記する
-- 初回ロード後はモデルと OpenVINO IR を `cache/` に保存する
+The current app is not a true streaming decoder. It records browser microphone audio, cuts it into short chunks, sends each chunk to the local server, and runs Qwen3-ASR on each chunk in order.
 
-## ファイル構成
+## Repository Layout
 
 ```text
 fast_asr_on_AIPC/
-|-- main.py                  # ASR 実行コアと CLI
-|-- web_app.py               # HTTP サーバー、静的配信、API
-|-- requirements.txt         # Python 依存関係
+|-- main.py                  # ASR runtime core and CLI
+|-- web_app.py               # Static file server and HTTP API
+|-- requirements.txt         # Python dependencies
 |-- static/
-|   |-- index.html           # GUI の HTML
-|   |-- app.js               # 録音、チャンク化、API 呼び出し、表示更新
-|   `-- styles.css           # GUI の見た目
+|   |-- index.html           # Browser UI
+|   |-- app.js               # Recording, chunking, API calls, UI updates
+|   `-- styles.css           # Layout and Transcript scrolling
 |-- third_party/
-|   `-- qwen_3_asr_helper.py # Qwen3-ASR の OpenVINO 変換/実行ヘルパー
+|   `-- qwen_3_asr_helper.py # Qwen3-ASR OpenVINO conversion/runtime helper
 |-- cache/
-|   |-- huggingface/         # Hugging Face モデルキャッシュ
-|   `-- openvino/            # OpenVINO IR と compiled cache
+|   |-- huggingface/         # Hugging Face cache
+|   `-- openvino/            # OpenVINO IR cache
 `-- docs/
     `-- implementation.md
 ```
 
-`cache/` は生成物なのでリポジトリに含めない。
+`cache/` and `.venv/` are generated and are not tracked by Git.
 
-## 依存関係
+## Dependencies
 
-`requirements.txt` の主要依存は以下。
+Main packages:
 
 ```text
 torch
@@ -51,16 +46,16 @@ sounddevice
 qwen-asr
 ```
 
-役割は次の通り。
+Roles:
 
-- `qwen-asr`: Qwen3-ASR の通常実行
-- `torch`, `transformers`: 非 OpenVINO モデル実行、デバイス検出
-- `openvino`, `optimum-intel`: Intel NPU/GPU 向け推論と変換
-- `librosa`: 音声ファイルを 16 kHz mono float32 に読み込み
-- `soundfile`: Qwen3-ASR に渡す一時 WAV を書き出し
-- `sounddevice`: CLI の固定秒数マイク録音
+- `qwen-asr`: Qwen3-ASR model API
+- `openvino`, `optimum-intel`: OpenVINO conversion and inference
+- `torch`, `transformers`: model execution and generation utilities
+- `soundfile`: in-memory upload decoding and temporary WAV output inside runners
+- `librosa`: resampling to 16 kHz when needed
+- `sounddevice`: CLI microphone recording
 
-## 起動方法
+## Startup
 
 ```powershell
 python -m venv .venv
@@ -69,45 +64,26 @@ pip install -r requirements.txt
 python web_app.py
 ```
 
-ブラウザで開く。
+Open:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-ポートを変える場合。
-
-```powershell
-python web_app.py --host 127.0.0.1 --port 8080
-```
-
-CLI で直接実行する場合。
+CLI examples:
 
 ```powershell
 python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.wav --benchmark
 python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark --json
 ```
 
-## モデル
-
-既定モデルは次。
-
-```text
-neosophie/Qwen3-ASR-1.7B-JA
-```
-
-GUI は日本語認識に特化し、このモデルを固定で使う。
-
-`main.py` では `DEFAULT_MODEL`, `JAPANESE_LANGUAGE`, `MODEL_CHOICES` で定義する。`JAPANESE_LANGUAGE` は `qwen-asr` の正規言語名 `Japanese` で、Qwen3-ASR の `transcribe()` 呼び出しへ明示的に渡す。
-
-## 全体アーキテクチャ
+## Architecture
 
 ```text
 Browser
   static/index.html
   static/app.js
     |
-    | GET  /api/models
     | GET  /api/devices?model=...
     | POST /api/warmup
     | POST /api/transcribe multipart/form-data
@@ -118,136 +94,169 @@ web_app.py
     v
 main.py
   warmup_asr_model()
-  run_asr()
+  run_asr_samples()
   runner.transcribe()
     |
     v
 Qwen3-ASR / OpenVINO / PyTorch
 ```
 
-ブラウザは Web Audio API でマイク音声を取り、16 kHz WAV チャンクへ変換して `POST /api/transcribe` に送る。サーバーは受け取った WAV を一時ファイルに保存し、`main.run_asr()` に渡す。
+The browser records microphone audio with Web Audio APIs, converts chunks to 16 kHz WAV, and posts them to `/api/transcribe`. The server decodes uploaded audio in memory and calls `main.run_asr_samples()`.
 
-## バックエンド設計
+## Device Policy
 
-`main.py` は ASR 実行コアで、CLI と Web API の両方から使う。
-
-主要な公開関数。
-
-- `available_devices()`: 使用可能な推論デバイスを返す
-- `device_choices(model_ref)`: GUI 用のデバイス選択肢を返す
-- `model_choices()`: GUI 用のモデル選択肢を返す
-- `warmup_asr_model(model_ref, requested_device)`: モデルをロードし、必要なら OpenVINO 変換する
-- `run_asr(args)`: 音声読み込み、推論、ベンチマーク生成を行う
-
-### デバイス選択
-
-GUI/CLI の入力値は `DEVICE_ALIASES` で内部表現へ変換する。
+User-facing device aliases:
 
 ```text
-auto      -> AUTO
-intel_npu -> OPENVINO_NPU
-intel_gpu -> OPENVINO_GPU
-cpu       -> CPU
+auto       -> AUTO
+intel_npu  -> OPENVINO_NPU
+npu        -> OPENVINO_NPU
+intel_gpu  -> OPENVINO_GPU
+cpu        -> CPU
 ```
 
-`auto` の優先順は次。
+For generic OpenVINO-capable models, `auto_device_target()` prefers:
 
 ```text
 OPENVINO_NPU -> OPENVINO_GPU -> CPU
 ```
 
-OpenVINO の実デバイス名へ渡すときは、`OPENVINO_NPU` を `NPU`、`OPENVINO_GPU` を `GPU` に変換する。
+For Qwen3-ASR, NPU is not used. The current Intel NPU OpenVINO compiler cannot lower this Qwen3-ASR graph reliably, even after dynamic input bounds are added. Qwen3-ASR uses:
 
-### Runner の種類
+```text
+OPENVINO_GPU -> CPU
+```
 
-`get_moonshine_runner(model_ref, device)` がモデルとデバイスに応じて Runner を選ぶ。関数名に Moonshine が残っているが、GUI の実行対象は日本語向け Qwen3-ASR。
+For Qwen3-ASR, requests for `auto`, `intel_npu`, `npu`, `OPENVINO_NPU`, or `NPU` are routed to GPU or CPU. The GUI marks `intel_npu` unavailable for the default model.
 
-- `Qwen3AsrRunner`: Qwen3-ASR を `qwen-asr` で実行する
-- `OpenVINOQwen3AsrRunner`: Qwen3-ASR を `third_party.qwen_3_asr_helper` で OpenVINO IR に変換して実行する
-- `MoonshineRunner`: CLI から Qwen3-ASR 以外を試す場合の汎用 Runner
-- `OpenVINOMoonshineRunner`: CLI から Qwen3-ASR 以外を OpenVINO で試す場合の汎用 Runner
+## Cache
 
-選択ルール。
+Constants:
+
+```text
+HF_CACHE_DIR              = cache/huggingface
+OPENVINO_CACHE_DIR        = cache/openvino
+RUNNER_CACHE              = {(model_ref, selected_device): runner}
+AVAILABLE_DEVICES_CACHE   = list[str] | None
+```
+
+`available_devices()` caches OpenVINO device discovery. This avoids repeated device probing for every live audio chunk. Use `available_devices(refresh=True)` to force a fresh probe.
+
+Runners are cached by `(model_ref, selected_device)` to avoid reloading the model for every chunk.
+
+## main.py
+
+Important functions:
+
+- `available_devices(refresh=False)`: returns available inference devices
+- `device_choices(model_ref)`: returns GUI device options
+- `model_choices()`: returns GUI model options
+- `warmup_asr_model(model_ref, requested_device)`: loads the selected runner before live transcription
+- `run_asr(args)`: CLI entry path; reads audio then delegates to `run_asr_samples()`
+- `run_asr_samples(...)`: shared runtime path for already-decoded float32 PCM
+
+`run_asr_samples()` flow:
+
+1. Validate model reference.
+2. Get available devices.
+3. Select the actual runtime device.
+4. Get or create a runner.
+5. Call `runner.transcribe(raw_speech, max_new_tokens)`.
+6. Strip ASR tags from the result.
+7. Return a JSON payload and `BenchmarkResult`.
+
+## Runner Selection
+
+`get_moonshine_runner(model_ref, device)` selects a runner. The function name still contains `moonshine`, but the default GUI model is Qwen3-ASR.
 
 ```text
 Qwen3-ASR + OPENVINO_* -> OpenVINOQwen3AsrRunner
-Qwen3-ASR + その他    -> Qwen3AsrRunner
-その他 + OPENVINO_*   -> OpenVINOMoonshineRunner
-その他 + その他       -> MoonshineRunner
+Qwen3-ASR + other      -> Qwen3AsrRunner
+other + OPENVINO_*     -> OpenVINOMoonshineRunner
+other + other          -> MoonshineRunner
 ```
 
-Runner は `(model_ref, device)` をキーに `RUNNER_CACHE` へ保存する。Web GUI の連続チャンク処理では、同じモデルとデバイスの Runner を再利用する。
+### Qwen3AsrRunner
 
-## キャッシュ
+Uses `qwen_asr.Qwen3ASRModel.from_pretrained()`.
 
-キャッシュ先は `main.py` の定数で管理する。
+- CPU execution
+- `max_inference_batch_size=1`
+- `max_new_tokens=64`
+- `language="Japanese"`
+
+The `qwen-asr` API expects an audio path, so the runner writes a temporary 16 kHz WAV and passes the path to `model.transcribe()`.
+
+### OpenVINOQwen3AsrRunner
+
+Uses `third_party.qwen_3_asr_helper`.
+
+1. `convert_qwen3_asr_model()` creates or reuses OpenVINO IR.
+2. `OVQwen3ASRModel.from_pretrained()` loads the IR.
+3. Inference writes a temporary 16 kHz WAV and passes the path to `model.transcribe()`.
+
+If `device == "NPU"` is passed directly, the runner redirects to GPU or CPU. This protects against code paths that bypass normal device selection.
+
+### third_party/qwen_3_asr_helper.py
+
+This helper converts and runs Qwen3-ASR with OpenVINO.
+
+It defines upper bounds for dynamic dimensions to avoid the NPU compiler error "Missing upper bound for one or more nodes":
 
 ```text
-HF_CACHE_DIR       = cache/huggingface
-OPENVINO_CACHE_DIR = cache/openvino
+NPU_MAX_BATCH_SIZE
+NPU_MAX_AUDIO_CHUNKS
+NPU_MAX_AUDIO_SEQUENCE_LENGTH
+NPU_MAX_TEXT_SEQUENCE_LENGTH
 ```
 
-Hugging Face のモデルファイルは `cache/huggingface` に保存する。OpenVINO 変換済みモデルは `cache/openvino/<model_refを安全な名前にした文字列>/` に保存する。OpenVINO compiled cache は `cache/openvino/compiled` に置く。
+Those bounds are useful, but the full Qwen3-ASR graph still does not compile reliably for Intel NPU. The main app therefore does not route Qwen3-ASR to NPU.
 
-モデル参照をディレクトリ名に変換するときは `sanitize_model_ref()` を使い、英数字、`-`, `_`, `.` 以外を `_` に置き換える。
+## web_app.py
 
-## Web サーバー
+The server uses only standard-library HTTP classes:
 
-`web_app.py` は標準ライブラリの `ThreadingHTTPServer` と `SimpleHTTPRequestHandler` だけで実装する。
+- `ThreadingHTTPServer`
+- `SimpleHTTPRequestHandler`
 
-### 静的ファイル
+Static routing:
 
-`translate_path()` で次のように配信する。
+```text
+/               -> static/index.html
+/static/<path>  -> static/<path>
+other           -> static/<path>
+```
 
-- `/` -> `static/index.html`
-- `/static/<path>` -> `static/<path>`
-- その他 -> `static/<path>`
+### GET /api/devices
 
-### API
+Returns physical devices and GUI choices.
 
-#### `GET /api/models`
-
-モデル選択肢を返す。
-
-レスポンス例。
+Example:
 
 ```json
 {
-  "models": [
-    {
-      "value": "neosophie/Qwen3-ASR-1.7B-JA",
-      "label": "Japanese",
-      "description": "Japanese ASR via qwen-asr / OpenVINO"
-    }
-  ]
-}
-```
-
-#### `GET /api/devices?model=<model>`
-
-使用可能なデバイスと GUI 用選択肢を返す。
-
-レスポンス例。
-
-```json
-{
-  "devices": ["OPENVINO_NPU", "CPU"],
+  "devices": ["OPENVINO_NPU", "OPENVINO_GPU", "CPU"],
   "choices": [
     {
       "value": "auto",
-      "label": "auto (OPENVINO_NPU)",
+      "label": "auto (OPENVINO_GPU)",
       "available": true,
-      "target": "OPENVINO_NPU"
+      "target": "OPENVINO_GPU"
+    },
+    {
+      "value": "intel_npu",
+      "label": "Intel NPU (OpenVINO)",
+      "available": false,
+      "target": "OPENVINO_GPU",
+      "reason": "Qwen3-ASR currently uses Intel GPU or CPU because the OpenVINO NPU compiler cannot lower this graph."
     }
   ]
 }
 ```
 
-#### `POST /api/warmup`
+### POST /api/warmup
 
-モデルを事前ロードする。初回はモデルダウンロードや OpenVINO 変換が走る。
-
-リクエスト。
+Request:
 
 ```json
 {
@@ -256,14 +265,14 @@ Hugging Face のモデルファイルは `cache/huggingface` に保存する。O
 }
 ```
 
-レスポンス。
+Response:
 
 ```json
 {
   "model": "neosophie/Qwen3-ASR-1.7B-JA",
   "requested_device": "auto",
-  "selected_device": "OPENVINO_NPU",
-  "available_devices": ["OPENVINO_NPU", "CPU"],
+  "selected_device": "OPENVINO_GPU",
+  "available_devices": ["OPENVINO_NPU", "OPENVINO_GPU", "CPU"],
   "model_load_seconds": 12.3456,
   "cache_hit": false,
   "cache_dir": "cache\\openvino",
@@ -271,33 +280,41 @@ Hugging Face のモデルファイルは `cache/huggingface` に保存する。O
 }
 ```
 
-#### `POST /api/transcribe`
+### POST /api/transcribe
 
-`multipart/form-data` で音声チャンクを受け取り、認識結果とベンチマークを返す。
+Accepts `multipart/form-data`.
 
-フォーム項目。
+Fields:
 
 ```text
-model: Hugging Face model id またはローカルモデルディレクトリ
+model: Hugging Face model id
 device: auto | intel_npu | intel_gpu | cpu
-audio: WAV などの音声ファイル
+audio: uploaded audio chunk
 ```
 
-レスポンス。
+The server does not write the uploaded chunk to a temporary file. It decodes audio bytes in memory:
+
+```text
+soundfile.read(io.BytesIO(audio_bytes), dtype="float32")
+```
+
+If the sample rate is not 16 kHz, it resamples with `librosa.resample()`.
+
+Response:
 
 ```json
 {
-  "text": "認識結果",
+  "text": "recognized text",
   "chunks": [],
   "model": "neosophie/Qwen3-ASR-1.7B-JA",
   "requested_device": "auto",
-  "selected_device": "OPENVINO_NPU",
+  "selected_device": "OPENVINO_GPU",
   "fallback_device": null,
-  "available_devices": ["OPENVINO_NPU", "CPU"],
-  "input_source": "C:\\Users\\...\\tmp.wav",
+  "available_devices": ["OPENVINO_NPU", "OPENVINO_GPU", "CPU"],
+  "input_source": "live-1.wav",
   "benchmark": {
     "model_load_seconds": 0.0,
-    "audio_preprocess_seconds": 0.0123,
+    "audio_preprocess_seconds": 0.0,
     "inference_seconds": 0.4567,
     "postprocess_seconds": 0.0,
     "total_processing_seconds": 0.469,
@@ -307,92 +324,64 @@ audio: WAV などの音声ファイル
 }
 ```
 
-エラー時は HTTP 400 と `{ "error": "message" }` を返す。
+Errors return HTTP 400 with:
 
-## フロントエンド
-
-`static/index.html` は単一画面の操作 UI を持つ。
-
-- デバイス選択
-- Start / Stop / Clear
-- 音量メーター
-- 状態表示
-- Transcript
-- 最新メトリクス表示
-
-`static/app.js` は状態を `state` オブジェクトにまとめる。
-
-重要な状態。
-
-```js
-{
-  liveRunning: false,
-  warmed: false,
-  stream: null,
-  audioContext: null,
-  source: null,
-  processor: null,
-  analyser: null,
-  meterTimer: null,
-  chunks: [],
-  chunkSampleCount: 0,
-  hasSpeech: false,
-  silenceMs: 0,
-  flushInProgress: false,
-  submitChain: Promise.resolve(),
-  chunkIndex: 0
-}
+```json
+{ "error": "message" }
 ```
 
-### ライブ録音フロー
+## Frontend
 
-1. `Start Live` を押す
-2. `warmupModel()` が `POST /api/warmup` を呼ぶ
-3. `navigator.mediaDevices.getUserMedia({ audio: true })` でマイク許可を取る
-4. `AudioContext` を作る
-5. `MediaStreamSource -> Analyser -> ScriptProcessor -> destination` を接続する
-6. `onaudioprocess` で Float32 PCM を `collectAudioFrame()` に渡す
-7. RMS で発話開始と無音継続を判定し、動的に `flushLiveChunk()` を呼ぶ
-8. `Stop` 時に最後のチャンクを送信し、録音リソースを解放する
+`static/index.html` is a single-screen UI:
 
-### チャンク処理
+- Device selector
+- Start / Stop / Clear buttons
+- audio meter
+- status
+- warmup notice
+- Transcript
+- latest metrics
 
-`collectAudioFrame()` の処理。
+`static/app.js` handles:
 
-1. 入力 frame を `state.chunks` に積み、サンプル数を加算する
-2. frame の RMS が `speechRmsThreshold` 以上なら発話中とみなす
-3. 発話後に `trailingSilenceMs` 以上の無音が続いたらチャンクを送る
-4. 発話が長く続いた場合は `maxChunkMs` で強制的にチャンクを送る
-5. 発話がないまま `idleDropMs` を超えた音声は捨てて、無音だけの送信を避ける
+- loading device choices
+- model warmup
+- microphone capture
+- frame collection through `ScriptProcessorNode`
+- RMS-based speech/silence detection
+- chunk encoding to 16 kHz WAV
+- serialized `/api/transcribe` calls
+- Transcript and metrics updates
 
-`flushLiveChunk()` の処理。
+### Chunk Settings
 
-1. `state.chunks` を取り出してチャンク状態をリセットする
-2. `mergeFloat32()` で連結する
-3. `resampleLinear()` でブラウザの sample rate から 16 kHz へ変換する
-4. `audioRms()` が `submitRmsThreshold` 未満なら無音として捨てる
-5. `encodeWav()` で 16-bit PCM WAV にする
-6. `submitAudio()` で `POST /api/transcribe` へ送る
-7. `appendLiveResult()` で `asr_text` の本文だけを追記する
-8. 本文がある場合だけ `renderMetrics()` で RTF や推論時間を更新する
+```js
+const chunking = {
+  speechRmsThreshold: 0.01,
+  submitRmsThreshold: 0.003,
+  minChunkMs: 350,
+  trailingSilenceMs: 280,
+  maxChunkMs: 2400,
+  idleDropMs: 900,
+};
+```
 
-`submitChain` で送信を直列化する。チャンクの推論が重なって Runner を同時に叩かないようにするため。
+`submitChain` serializes requests so multiple chunks do not access the same runner concurrently.
 
-## ASR 実行フロー
+### Transcript Layout
 
-`run_asr(args)` の処理。
+`static/styles.css` keeps the app inside the viewport:
 
-1. `validate_inputs()` でモデル名と音声パスを確認する
-2. `available_devices()` で使用可能なデバイスを調べる
-3. `select_model_device()` で要求デバイスを実デバイスに決める
-4. `get_moonshine_runner()` で Runner を取得または作成する
-5. `--mic` なら `read_microphone_16khz()`、`--audio` なら `read_audio_16khz()` で 16 kHz mono にする
-6. `runner.transcribe(raw_speech, 64)` を呼ぶ
-7. 必要なら fallback を行う
-8. `BenchmarkResult` を作る
-9. Web/CLI 共通の payload を返す
+- `body` and `.app-shell` use `100dvh`
+- `.workspace` receives the remaining height
+- `.transcript-pane` does not grow with content
+- `#transcript` scrolls internally
+- narrow layouts reserve at least 280 px for Transcript
+- metrics are constrained to a small scroll area on narrow layouts
 
-`BenchmarkResult` の項目。
+`appendLiveResult()` only auto-scrolls when the user is already near the bottom. If the user scrolls up to read older text, new chunks do not force the panel back to the bottom.
+
+## BenchmarkResult
 
 ```text
 model_load_seconds
@@ -404,121 +393,44 @@ audio_duration_seconds
 rtf
 ```
 
-RTF は次で計算する。
-
 ```text
 rtf = total_processing_seconds / audio_duration_seconds
 ```
 
-`rtf < 1.0` なら、音声長より短い時間で処理できている。
+## Checks
 
-## Qwen3-ASR 実行
-
-### 通常実行
-
-`Qwen3AsrRunner` は `qwen_asr.Qwen3ASRModel.from_pretrained()` を使う。
-
-- `device_map="cpu"`、`dtype=torch.float32`
-- `max_inference_batch_size=1`
-- `max_new_tokens=64`
-
-`qwen-asr` はファイルパスを入力に取るため、`transcribe()` では一時 WAV を作る。日本語特化のため、`model.transcribe(..., language="Japanese")` を指定する。
-
-```text
-raw_speech list[float] -> temp .wav at 16 kHz -> model.transcribe(audio=...)
-```
-
-### OpenVINO 実行
-
-`OpenVINOQwen3AsrRunner` は `third_party.qwen_3_asr_helper` を使う。
-
-1. `convert_qwen3_asr_model(model_id, output_dir, quantization_config=None)` で変換する
-2. `OVQwen3ASRModel.from_pretrained(model_dir, device, ...)` でロードする
-3. 通常実行と同じく、一時 WAV を作って `model.transcribe(audio=...)` に渡す
-
-変換先は `cache/openvino/<sanitized_model_ref>/`。
-
-## 汎用 SpeechSeq2Seq 実行
-
-GUI では使わない。CLI から Qwen3-ASR 以外のモデルを指定した場合の互換経路として残す。
-
-### PyTorch
-
-`MoonshineRunner` は `AutoProcessor` と `AutoModelForSpeechSeq2Seq` をロードする。
-
-- `cpu` と `float32`
-- `processor(..., sampling_rate=...)` で入力を作る
-- `model.generate(**inputs, max_length=max_length)` で生成する
-- `processor.decode(..., skip_special_tokens=True)` で文字列化する
-
-### OpenVINO
-
-`OpenVINOMoonshineRunner` は Optimum Intel を使う。
-
-- 変換済み IR があれば `OVModelForSpeechSeq2Seq.from_pretrained(ov_model_dir, device=...)`
-- なければ `optimum.exporters.openvino.main_export()` で変換する
-- `ov_config={"CACHE_DIR": "cache/openvino/compiled"}` を指定する
-
-現行実装では、Qwen3-ASR 以外を OpenVINO で実行して空文字になり、かつ入力音量が十分ある場合、CPU Runner で再認識する。
-
-## 再実装手順
-
-最小構成で同じアプリを作るなら、次の順で実装する。
-
-1. `requirements.txt` を作る
-2. `main.py` に定数、デバイス検出、モデル選択、Runner キャッシュを作る
-3. `Qwen3AsrRunner` と `OpenVINOQwen3AsrRunner` を実装する
-4. `read_audio_16khz()` と `read_microphone_16khz()` を実装する
-5. `run_asr()` を実装し、JSON payload を返せるようにする
-6. CLI の `argparse` と `main()` を追加する
-7. `web_app.py` で静的配信、`/api/models`, `/api/devices`, `/api/warmup`, `/api/transcribe` を実装する
-8. `static/index.html` で操作 UI を作る
-9. `static/app.js` でモデル/デバイス取得、ウォームアップ、録音、チャンク化、送信、表示更新を実装する
-10. `static/styles.css` で 1 画面に収まる作業 UI を整える
-11. `cache/` と `.venv/` を `.gitignore` に入れる
-
-## 動作確認
-
-Python の構文確認。
+Python syntax:
 
 ```powershell
-python -m py_compile main.py web_app.py
+python -m py_compile main.py web_app.py third_party/qwen_3_asr_helper.py
 ```
 
-Web サーバー起動。
+Device API:
 
 ```powershell
-python web_app.py --host 127.0.0.1 --port 8000
+Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8000/api/devices?model=neosophie%2FQwen3-ASR-1.7B-JA" | Select-Object -ExpandProperty Content
 ```
 
-API 確認。
-
-```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/models | Select-Object -ExpandProperty Content
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/devices | Select-Object -ExpandProperty Content
-```
-
-音声ファイルで CLI 確認。
+CLI:
 
 ```powershell
 python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.wav --benchmark --json
 ```
 
-ブラウザ確認。
+Browser:
 
-1. `http://127.0.0.1:8000` を開く
-2. `Start Live` を押す
-3. マイク許可を与える
-4. 初回ウォームアップが終わるまで待つ
-5. 話した内容が `[1] ...`, `[2] ...` の形で追記されることを確認する
-6. `rtf`, `infer sec`, `total sec` が表示されることを確認する
+1. Open `http://127.0.0.1:8000`.
+2. Hard reload with `Ctrl + F5`.
+3. Press `Start`.
+4. Allow microphone access.
+5. Confirm Transcript stays visible and scrolls internally.
+6. Confirm metrics do not collapse the Transcript area.
 
-## 注意点
+## Notes
 
-- 初回はモデルダウンロードと OpenVINO 変換で時間がかかる
-- OpenVINO NPU/GPU がない環境では `auto` は CPU へ落ちる
-- ブラウザのマイク利用には `http://127.0.0.1` または HTTPS が必要
-- GUI のマイク録音はブラウザ側で行う。CLI の `--mic` は `sounddevice` で固定秒数だけ録音する別経路
-- `ScriptProcessorNode` は古い API だが、現行実装では簡単さを優先して使っている
-- `multipart/form-data` のパーサーは `web_app.py` 内の簡易実装。複雑なフォームに拡張するなら標準/外部の堅牢なパーサーを検討する
-- 長時間運用では `RUNNER_CACHE` がモデル/デバイスの組み合わせごとにメモリを保持する
+- Qwen3-ASR is run as short chunked inference, not true token streaming.
+- First run can take a long time because of model download and OpenVINO IR conversion.
+- Qwen3-ASR Intel NPU execution is disabled; use GPU or CPU.
+- Browser microphone capture requires `http://127.0.0.1` or HTTPS.
+- `ScriptProcessorNode` is an older API, kept here for simplicity.
+- Long-running servers keep loaded model runners in memory through `RUNNER_CACHE`.
