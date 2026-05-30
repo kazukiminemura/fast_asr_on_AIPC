@@ -271,10 +271,19 @@ function appendLiveResult(data) {
   els.transcript.classList.remove("error");
   const text = extractAsrText(data.text);
   if (text) {
+    const shouldFollowLatest = transcriptIsAtBottom();
     els.transcript.textContent += `${els.transcript.textContent ? "\n" : ""}${text}`;
-    els.transcript.scrollTop = els.transcript.scrollHeight;
+    if (shouldFollowLatest) {
+      els.transcript.scrollTop = els.transcript.scrollHeight;
+    }
     renderMetrics(data, "latest");
   }
+}
+
+function transcriptIsAtBottom() {
+  const distanceFromBottom =
+    els.transcript.scrollHeight - els.transcript.scrollTop - els.transcript.clientHeight;
+  return distanceFromBottom < 48;
 }
 
 function extractAsrText(rawText) {
