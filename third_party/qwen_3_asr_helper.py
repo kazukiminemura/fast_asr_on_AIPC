@@ -392,6 +392,26 @@ THINKER_AUDIO_NAME = "openvino_thinker_audio_model.xml"
 THINKER_AUDIO_ENCODER_NAME = "openvino_thinker_audio_encoder_model.xml"
 THINKER_EMBEDDING_NAME = "openvino_thinker_embedding_model.xml"
 
+NPU_MAX_BATCH_SIZE = 32
+NPU_MAX_AUDIO_CHUNKS = 128
+NPU_MAX_AUDIO_SEQUENCE_LENGTH = 1500
+NPU_MAX_TEXT_SEQUENCE_LENGTH = 4096
+
+
+def _bounded_dim(min_length, max_length):
+    return ov.Dimension(min_length, max_length)
+
+
+def _is_npu_device(device):
+    return str(device).upper().startswith("NPU")
+
+
+def _compile_model_with_npu_bounds(model_or_path, device, input_shapes=None):
+    compiled_model = ov.Core().read_model(model_or_path) if isinstance(model_or_path, (str, Path)) else model_or_path
+    if _is_npu_device(device) and input_shapes:
+        compiled_model.reshape(input_shapes)
+    return ov.Core().compile_model(compiled_model, device)
+
 
 def _get_feat_extract_output_lengths(input_lengths):
     """
@@ -471,6 +491,14 @@ def convert_qwen3_asr_model(model_id, output_dir, quantization_config=None, use_
         ov_model = ov.convert_model(
             model.thinker.model.get_input_embeddings(),
             example_input=torch.ones([2, 2], dtype=torch.int64),
+            input=[
+                ov.PartialShape(
+                    [
+                        _bounded_dim(1, NPU_MAX_BATCH_SIZE),
+                        _bounded_dim(1, NPU_MAX_TEXT_SEQUENCE_LENGTH),
+                    ]
+                )
+            ],
         )
         ov.save_model(ov_model, thinker_embedding_path)
         del ov_model
@@ -527,7 +555,15 @@ def convert_qwen3_asr_model(model_id, output_dir, quantization_config=None, use_
             example_input={
                 "padded_feature": torch.randn([3, num_mel_bins, 100], dtype=torch.float32),
             },
-            input=[ov.PartialShape([-1, num_mel_bins, -1])],
+            input=[
+                ov.PartialShape(
+                    [
+                        _bounded_dim(1, NPU_MAX_AUDIO_CHUNKS),
+                        num_mel_bins,
+                        _bounded_dim(1, 2 * audio.config.n_window),
+                    ]
+                )
+            ],
         )
         ov.save_model(ov_model, thinker_audio_path)
         del ov_model
@@ -547,8 +583,8 @@ def convert_qwen3_asr_model(model_id, output_dir, quantization_config=None, use_
                 "cu_seqlens": torch.tensor([0, 5], dtype=torch.int32),
             },
             input=[
-                ov.PartialShape([-1, d_model]),
-                ov.PartialShape([-1]),
+                ov.PartialShape([_bounded_dim(1, NPU_MAX_AUDIO_SEQUENCE_LENGTH), d_model]),
+                ov.PartialShape([_bounded_dim(1, NPU_MAX_AUDIO_CHUNKS + 1)]),
             ],
         )
         ov.save_model(ov_model, thinker_audio_encoder_path)
@@ -636,16 +672,16 @@ def convert_qwen3_asr_model(model_id, output_dir, quantization_config=None, use_
         }
 
         input_shapes = [
-            ov.PartialShape([-1, -1]),
-            ov.PartialShape([3, -1, -1]),
+            ov.PartialShape([_bounded_dim(1, NPU_MAX_BATCH_SIZE), _bounded_dim(1, NPU_MAX_TEXT_SEQUENCE_LENGTH)]),
+            ov.PartialShape([3, _bounded_dim(1, NPU_MAX_BATCH_SIZE), _bounded_dim(1, NPU_MAX_TEXT_SEQUENCE_LENGTH)]),
         ]
         input_shapes += (
             [
                 ov.PartialShape(
                     [
-                        -1,
+                        _bounded_dim(1, NPU_MAX_BATCH_SIZE),
                         lang_model.model.config.num_key_value_heads,
-                        -1,
+                        _bounded_dim(1, NPU_MAX_TEXT_SEQUENCE_LENGTH),
                         lang_model.model.config.head_dim,
                     ]
                 )
@@ -653,7 +689,15 @@ def convert_qwen3_asr_model(model_id, output_dir, quantization_config=None, use_
             * 2
             * num_pkv
         )
-        input_shapes += [ov.PartialShape([-1, -1, hidden_size])]
+        input_shapes += [
+            ov.PartialShape(
+                [
+                    _bounded_dim(1, NPU_MAX_BATCH_SIZE),
+                    _bounded_dim(1, NPU_MAX_TEXT_SEQUENCE_LENGTH),
+                    hidden_size,
+                ]
+            )
+        ]
 
         __make_16bit_traceable(lang_model)
         ov_model = ov.convert_model(lang_model, example_input=example_input, input=input_shapes)
@@ -790,35 +834,100 @@ class OVQwen3ASRThinkerForConditionalGeneration(GenerationMixin):
         self.device = torch.device("cpu")
         self.dtype = torch.float16
 
+        # Audio/text bounds are needed by the Intel NPU compiler; unbounded dynamic
+        # dimensions in cached IR fail with "Missing upper bound".
+        audio_config = self.config.audio_config
+        self.max_source_positions = audio_config.max_source_positions
+        self.n_window = audio_config.n_window
+        self.n_window_infer = getattr(audio_config, "n_window_infer", self.n_window * 2)
+        embed_dim = audio_config.d_model
+        num_mel_bins = audio_config.num_mel_bins
+        max_audio_sequence_length = max(self.max_source_positions, NPU_MAX_AUDIO_SEQUENCE_LENGTH)
+        text_config = getattr(self.config, "text_config", self.config)
+        hidden_size = text_config.hidden_size
+        max_text_sequence_length = min(
+            getattr(text_config, "max_position_embeddings", NPU_MAX_TEXT_SEQUENCE_LENGTH),
+            NPU_MAX_TEXT_SEQUENCE_LENGTH,
+        )
+
         # Load audio encoder components
         print(f"⌛ Loading audio conv model from {self.model_dir / THINKER_AUDIO_NAME}")
-        self.audio_conv = ov.Core().compile_model(self.model_dir / THINKER_AUDIO_NAME, device)
+        self.audio_conv = _compile_model_with_npu_bounds(
+            self.model_dir / THINKER_AUDIO_NAME,
+            device,
+            {
+                "padded_feature": ov.PartialShape(
+                    [
+                        _bounded_dim(1, NPU_MAX_AUDIO_CHUNKS),
+                        num_mel_bins,
+                        _bounded_dim(1, 2 * self.n_window),
+                    ]
+                )
+            },
+        )
 
         print(f"⌛ Loading audio encoder model from {self.model_dir / THINKER_AUDIO_ENCODER_NAME}")
-        self.audio_encoder = ov.Core().compile_model(self.model_dir / THINKER_AUDIO_ENCODER_NAME, device)
+        self.audio_encoder = _compile_model_with_npu_bounds(
+            self.model_dir / THINKER_AUDIO_ENCODER_NAME,
+            device,
+            {
+                "hidden_states": ov.PartialShape([_bounded_dim(1, max_audio_sequence_length), embed_dim]),
+                "cu_seqlens": ov.PartialShape([_bounded_dim(1, NPU_MAX_AUDIO_CHUNKS + 1)]),
+            },
+        )
 
         # Load embedding model
         print(f"⌛ Loading embedding model from {self.model_dir / THINKER_EMBEDDING_NAME}")
-        self.embed_tokens_model = ov.Core().compile_model(self.model_dir / THINKER_EMBEDDING_NAME, device)
+        self.embed_tokens_model = _compile_model_with_npu_bounds(
+            self.model_dir / THINKER_EMBEDDING_NAME,
+            device,
+            {
+                "input": ov.PartialShape(
+                    [
+                        _bounded_dim(1, NPU_MAX_BATCH_SIZE),
+                        _bounded_dim(1, max_text_sequence_length),
+                    ]
+                )
+            },
+        )
 
         # Load language model (stateful)
         print(f"⌛ Loading language model from {self.model_dir / THINKER_LANGUAGE_NAME}")
         self.model = ov.Core().read_model(self.model_dir / THINKER_LANGUAGE_NAME)
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
+        if _is_npu_device(device):
+            language_shapes = {
+                "attention_mask": ov.PartialShape(
+                    [
+                        _bounded_dim(1, NPU_MAX_BATCH_SIZE),
+                        _bounded_dim(1, max_text_sequence_length),
+                    ]
+                ),
+                "position_ids": ov.PartialShape(
+                    [
+                        3,
+                        _bounded_dim(1, NPU_MAX_BATCH_SIZE),
+                        _bounded_dim(1, max_text_sequence_length),
+                    ]
+                ),
+                "inputs_embeds": ov.PartialShape(
+                    [
+                        _bounded_dim(1, NPU_MAX_BATCH_SIZE),
+                        _bounded_dim(1, max_text_sequence_length),
+                        hidden_size,
+                    ]
+                ),
+            }
+            if "beam_idx" in self.input_names:
+                language_shapes["beam_idx"] = ov.PartialShape([_bounded_dim(1, NPU_MAX_BATCH_SIZE)])
+            self.model.reshape(language_shapes)
         compiled_model = ov.Core().compile_model(self.model, device)
         self.request = compiled_model.create_infer_request()
 
         # Create embedding wrapper
         self._embedding_wrapper = self._create_embedding_wrapper()
         self.get_input_embeddings = lambda: self._embedding_wrapper
-
-        # Audio config
-        audio_config = self.config.audio_config
-        self.max_source_positions = audio_config.max_source_positions
-        self.n_window = audio_config.n_window
-        self.n_window_infer = getattr(audio_config, "n_window_infer", self.n_window * 2)
-        embed_dim = audio_config.d_model
 
         # Positional embeddings for audio
         self.positional_embedding = SinusoidsPositionEmbedding(self.max_source_positions, embed_dim)

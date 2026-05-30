@@ -210,6 +210,14 @@ class OpenVINOQwen3AsrRunner:
             ) from exc
 
         self.model_ref = model_ref
+        if device == "NPU":
+            fallback_device = openvino_target_name(qwen3_asr_device_target(available_devices()))
+            print(
+                "Qwen3-ASR is not routed to Intel NPU because the OpenVINO NPU "
+                f"compiler cannot lower this graph. Using {fallback_device} instead.",
+                file=sys.stderr,
+            )
+            device = fallback_device
         self.device_name = f"OPENVINO_{device}"
         self.soundfile = require_dependency("soundfile", "soundfile")
         ov_model_dir = OPENVINO_CACHE_DIR / sanitize_model_ref(model_ref)
@@ -251,7 +259,7 @@ def parse_args() -> argparse.Namespace:
         "--device",
         choices=tuple(DEVICE_ALIASES),
         default="auto",
-        help="Inference device. auto prefers Intel NPU, then Intel GPU, then CPU.",
+        help="Inference device. Qwen3-ASR auto prefers Intel GPU, then CPU.",
     )
     parser.add_argument(
         "--model",
@@ -330,6 +338,13 @@ def auto_device_target(devices: list[str]) -> str:
     return "CPU"
 
 
+def qwen3_asr_device_target(devices: list[str]) -> str:
+    for candidate in ("OPENVINO_GPU", "CPU"):
+        if candidate in devices:
+            return candidate
+    return "CPU"
+
+
 def is_openvino_device(device: str) -> bool:
     return device.startswith("OPENVINO_")
 
@@ -341,7 +356,7 @@ def openvino_target_name(device: str) -> str:
 def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
     devices = available_devices()
     if is_qwen3_asr_model(model_ref):
-        auto_target = auto_device_target(devices)
+        auto_target = qwen3_asr_device_target(devices)
         return [
             {
                 "value": "auto",
@@ -352,9 +367,9 @@ def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
             {
                 "value": "intel_npu",
                 "label": "Intel NPU (OpenVINO)",
-                "available": "OPENVINO_NPU" in devices,
-                "target": "OPENVINO_NPU",
-                "reason": "Uses converted OpenVINO IR under cache/openvino.",
+                "available": False,
+                "target": auto_target,
+                "reason": "Qwen3-ASR currently uses Intel GPU or CPU because the OpenVINO NPU compiler cannot lower this graph.",
             },
             {
                 "value": "intel_gpu",
@@ -424,8 +439,8 @@ def select_device(requested: str, devices: list[str]) -> str:
 
 def select_model_device(model_ref: str, requested: str, devices: list[str]) -> str:
     if is_qwen3_asr_model(model_ref):
-        if requested == "auto":
-            return auto_device_target(devices)
+        if requested in {"auto", "intel_npu", "npu", "OPENVINO_NPU", "NPU"}:
+            return qwen3_asr_device_target(devices)
     selected_device = select_device(requested, devices)
     return selected_device
 
