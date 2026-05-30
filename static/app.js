@@ -254,9 +254,9 @@ function resetWarmup() {
 function warmupNoticeText() {
   const model = getSelectedModel();
   if (model.includes("Qwen3-ASR")) {
-    return `The first start downloads, converts, and warms up ${model}. Intel GPU uses OpenVINO IR saved under cache\\openvino.`;
+    return `The first start downloads, converts, and warms up ${model}. Intel NPU/GPU uses OpenVINO IR saved under cache\\openvino.`;
   }
-  return `The first start downloads and warms up ${model}. Intel GPU uses OpenVINO when supported and saves converted model files under cache\\openvino for faster startup after restart.`;
+  return `The first start downloads and warms up ${model}. Intel NPU/GPU uses OpenVINO when supported and saves converted model files under cache\\openvino for faster startup after restart.`;
 }
 
 async function stopLive() {

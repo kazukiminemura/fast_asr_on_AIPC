@@ -50,6 +50,7 @@
             <span>Device</span>
             <select id="device" name="device">
               <option value="auto">auto</option>
+              <option value="intel_npu">intel npu</option>
               <option value="intel_gpu">intel gpu</option>
               <option value="cpu">cpu</option>
               <option value="gpu">gpu</option>
@@ -74,7 +75,7 @@
           <div class="source-title">Live microphone</div>
           <div id="warmupNotice" class="warmup-notice">
             The first start downloads, converts, and warms up neosophie/Qwen3-ASR-1.7B-JA. It can take a while.
-            Intel GPU uses OpenVINO IR saved under cache\openvino for faster startup after restart.
+            Intel NPU/GPU uses OpenVINO IR saved under cache\openvino for faster startup after restart.
           </div>
 
           <div id="micPane" class="pane active">

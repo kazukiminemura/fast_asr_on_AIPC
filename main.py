@@ -31,6 +31,8 @@ HF_CACHE_DIR = Path("cache") / "huggingface"
 OPENVINO_CACHE_DIR = Path("cache") / "openvino"
 DEVICE_ALIASES = {
     "auto": "AUTO",
+    "intel_npu": "OPENVINO_NPU",
+    "npu": "OPENVINO_NPU",
     "intel_gpu": "OPENVINO_GPU",
     "gpu": "CUDA",
     "cpu": "CPU",
@@ -254,7 +256,7 @@ def parse_args() -> argparse.Namespace:
         "--device",
         choices=tuple(DEVICE_ALIASES),
         default="auto",
-        help="Inference device. auto prefers Intel GPU, then CUDA, then CPU.",
+        help="Inference device. auto prefers Intel NPU, then Intel GPU, then CUDA, then CPU.",
     )
     parser.add_argument(
         "--model",
@@ -317,26 +319,51 @@ def available_devices() -> list[str]:
     try:
         openvino = require_dependency("openvino", "openvino")
         core = openvino.Core()
+        if "NPU" in core.available_devices:
+            devices.insert(0, "OPENVINO_NPU")
         if "GPU" in core.available_devices:
-            devices.insert(0, "OPENVINO_GPU")
+            insert_at = 1 if "OPENVINO_NPU" in devices else 0
+            devices.insert(insert_at, "OPENVINO_GPU")
     except SystemExit:
         pass
     if torch.cuda.is_available():
-        insert_at = 1 if "OPENVINO_GPU" in devices else 0
+        insert_at = sum(1 for device in devices if device.startswith("OPENVINO_"))
         devices.insert(insert_at, "CUDA")
     return devices
+
+
+def auto_device_target(devices: list[str]) -> str:
+    for candidate in ("OPENVINO_NPU", "OPENVINO_GPU", "CUDA", "CPU"):
+        if candidate in devices:
+            return candidate
+    return "CPU"
+
+
+def is_openvino_device(device: str) -> bool:
+    return device.startswith("OPENVINO_")
+
+
+def openvino_target_name(device: str) -> str:
+    return device.removeprefix("OPENVINO_")
 
 
 def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
     devices = available_devices()
     if is_qwen3_asr_model(model_ref):
-        auto_target = "OPENVINO_GPU" if "OPENVINO_GPU" in devices else "CUDA" if "CUDA" in devices else "CPU"
+        auto_target = auto_device_target(devices)
         return [
             {
                 "value": "auto",
                 "label": f"auto ({auto_target})",
                 "available": True,
                 "target": auto_target,
+            },
+            {
+                "value": "intel_npu",
+                "label": "Intel NPU (OpenVINO)",
+                "available": "OPENVINO_NPU" in devices,
+                "target": "OPENVINO_NPU",
+                "reason": "Uses converted OpenVINO IR under cache/openvino.",
             },
             {
                 "value": "intel_gpu",
@@ -359,13 +386,19 @@ def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
             },
         ]
 
-    auto_target = "OPENVINO_GPU" if "OPENVINO_GPU" in devices else "CUDA" if "CUDA" in devices else "CPU"
+    auto_target = auto_device_target(devices)
     return [
         {
             "value": "auto",
             "label": f"auto ({auto_target})",
             "available": True,
             "target": auto_target,
+        },
+        {
+            "value": "intel_npu",
+            "label": "Intel NPU (OpenVINO)",
+            "available": "OPENVINO_NPU" in devices,
+            "target": "OPENVINO_NPU",
         },
         {
             "value": "intel_gpu",
@@ -400,14 +433,12 @@ def is_qwen3_asr_model(model_ref: str) -> bool:
 def select_device(requested: str, devices: list[str]) -> str:
     requested_device = DEVICE_ALIASES[requested]
     if requested_device == "AUTO":
-        if "OPENVINO_GPU" in devices:
-            return "OPENVINO_GPU"
-        return "CUDA" if "CUDA" in devices else "CPU"
+        return auto_device_target(devices)
     if requested_device not in devices:
         available = ", ".join(devices) or "none"
         raise SystemExit(
             f"Requested device {requested_device} is not available for the "
-            f"Transformers Moonshine backend. Available devices: {available}"
+            f"ASR backend. Available devices: {available}"
         )
     return requested_device
 
@@ -415,9 +446,7 @@ def select_device(requested: str, devices: list[str]) -> str:
 def select_model_device(model_ref: str, requested: str, devices: list[str]) -> str:
     if is_qwen3_asr_model(model_ref):
         if requested == "auto":
-            if "OPENVINO_GPU" in devices:
-                return "OPENVINO_GPU"
-            return "CUDA" if "CUDA" in devices else "CPU"
+            return auto_device_target(devices)
     selected_device = select_device(requested, devices)
     return selected_device
 
@@ -478,12 +507,12 @@ def get_moonshine_runner(model_ref: str, device: str) -> tuple[Any, float]:
     HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     OPENVINO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     load_start = time.perf_counter()
-    if is_qwen3_asr_model(model_ref) and device == "OPENVINO_GPU":
-        runner = OpenVINOQwen3AsrRunner(model_ref, "GPU")
+    if is_qwen3_asr_model(model_ref) and is_openvino_device(device):
+        runner = OpenVINOQwen3AsrRunner(model_ref, openvino_target_name(device))
     elif is_qwen3_asr_model(model_ref):
         runner = Qwen3AsrRunner(model_ref, device)
-    elif device == "OPENVINO_GPU":
-        runner = OpenVINOMoonshineRunner(model_ref, "GPU")
+    elif is_openvino_device(device):
+        runner = OpenVINOMoonshineRunner(model_ref, openvino_target_name(device))
     else:
         runner = MoonshineRunner(model_ref, device)
     load_seconds = time.perf_counter() - load_start
@@ -497,7 +526,8 @@ def warmup_asr_model(model_ref: str, requested_device: str) -> dict[str, Any]:
     selected_device = select_model_device(model_ref, requested_device, devices)
     _runner, model_load_seconds = get_moonshine_runner(model_ref, selected_device)
     fallback_load_seconds = 0.0
-    if not is_qwen3_asr_model(model_ref) and selected_device == "OPENVINO_GPU":
+    needs_cpu_fallback = not is_qwen3_asr_model(model_ref) and is_openvino_device(selected_device)
+    if needs_cpu_fallback:
         _fallback_runner, fallback_load_seconds = get_moonshine_runner(model_ref, "CPU")
     return {
         "model": model_ref,
@@ -506,8 +536,8 @@ def warmup_asr_model(model_ref: str, requested_device: str) -> dict[str, Any]:
         "available_devices": devices,
         "model_load_seconds": model_load_seconds + fallback_load_seconds,
         "cache_hit": model_load_seconds == 0.0 and fallback_load_seconds == 0.0,
-        "cache_dir": str(OPENVINO_CACHE_DIR if selected_device == "OPENVINO_GPU" else HF_CACHE_DIR),
-        "fallback_device": "CPU" if not is_qwen3_asr_model(model_ref) and selected_device == "OPENVINO_GPU" else None,
+        "cache_dir": str(OPENVINO_CACHE_DIR if is_openvino_device(selected_device) else HF_CACHE_DIR),
+        "fallback_device": "CPU" if needs_cpu_fallback else None,
     }
 
 
@@ -533,7 +563,7 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     inference_start = time.perf_counter()
     text = runner.transcribe(raw_speech, args.max_new_tokens)
     fallback_device = None
-    if not is_qwen3_asr_model(args.model) and selected_device == "OPENVINO_GPU" and not text and audio_rms(raw_speech) > 0.001:
+    if not is_qwen3_asr_model(args.model) and is_openvino_device(selected_device) and not text and audio_rms(raw_speech) > 0.001:
         fallback_runner, fallback_load_seconds = get_moonshine_runner(args.model, "CPU")
         model_load_seconds += fallback_load_seconds
         text = fallback_runner.transcribe(raw_speech, args.max_new_tokens)
