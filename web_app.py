@@ -185,7 +185,7 @@ def transcribe_form(
             input_device=None,
             benchmark=True,
             json=True,
-            max_new_tokens=int(fields.get("max_new_tokens", "64") or "64"),
+            max_new_tokens=64,
         )
         payload, _benchmark = run_asr(args)
         return payload

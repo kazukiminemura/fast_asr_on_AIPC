@@ -1,18 +1,19 @@
 # fast_asr_on_AIPC
 
-Raptor mini (Preview) などの AIPC 上で、`neosophie/Qwen3-ASR-1.7B-JA` を使って日本語音声認識を行うブラウザGUIアプリです。
+Raptor mini (Preview) などの AIPC 上で、`neosophie/Qwen3-ASR-1.7B-JA` を使って日本語音声認識を行うブラウザ GUI アプリです。
 
-ブラウザのマイク入力を短い音声チャンクに分けて継続処理し、文字起こし結果と RTF を画面に追記します。最初の開始時は Hugging Face からモデルを取得してウォームアップするため時間がかかります。ウォームアップ後はメモリ上のモデルを再利用し、モデルファイルも `cache\huggingface` に残して次回起動を速くします。
+ブラウザのマイク入力を短い音声チャンクに分けて継続処理し、文字起こし結果と RTF を画面に追記します。最初の開始時は Hugging Face からモデルを取得し、Intel NPU/GPU を使う場合は OpenVINO IR へ変換するため時間がかかります。ウォームアップ後はメモリ上のモデルを再利用し、モデルファイルも `cache\huggingface` と `cache\openvino` に残して次回起動を速くします。
 
 ## Features
 
-- ブラウザGUIで操作
+- ブラウザ GUI で操作
 - `neosophie/Qwen3-ASR-1.7B-JA` による日本語ASR
-- Intel NPU/GPU 実行: OpenVINO / Optimum Intel
+- Intel NPU/GPU 実行: OpenVINO
 - ブラウザのリアルタイムマイク入力
-- チャンク単位の継続文字起こし
+- 発話と無音に合わせた動的チャンクの継続文字起こし
 - 初回ウォームアップ表示
 - モデルキャッシュ: `cache\huggingface`
+- OpenVINO IR キャッシュ: `cache\openvino`
 - 推論時間、全体処理時間、RTF の表示
 - CLI からの固定秒数録音にも対応
 
@@ -32,7 +33,7 @@ pip install -r requirements.txt
 neosophie/Qwen3-ASR-1.7B-JA
 ```
 
-初回実行時に自動でダウンロードされ、`cache\huggingface` に保存されます。GUI の `Model` 欄には Hugging Face model id またはローカルモデルディレクトリを指定できます。
+初回実行時に自動でダウンロードされ、`cache\huggingface` に保存されます。Intel NPU/GPU を選んだ場合は OpenVINO 変換済みファイルも `cache\openvino` に保存されます。GUI は日本語認識に特化し、このモデルを固定で使います。
 
 ## Run GUI
 
@@ -55,20 +56,19 @@ python web_app.py --port 8080
 ## GUI Usage
 
 1. `Model` が `neosophie/Qwen3-ASR-1.7B-JA` になっていることを確認する
-2. `Device` で `auto`, `intel_npu`, `intel_gpu`, `cpu`, `gpu` を選ぶ
-3. `Max tokens` と `Chunk seconds` を調整する
-4. `Start Live` を押す
-5. 初回はウォームアップ表示が出るので、モデル取得とロードが終わるまで待つ
-6. 話した内容がチャンクごとに `Transcript` へ追記される
-7. 終了するときは `Stop` を押す
+2. `Device` で `auto`, `intel_npu`, `intel_gpu`, `cpu` を選ぶ
+3. `Start Live` を押す
+4. 初回はウォームアップ表示が出るので、モデル取得とロードが終わるまで待つ
+5. `asr_text` の本文だけが `Transcript` へ追記される
+6. 終了するときは `Stop` を押す
 
 ブラウザでマイクを使う場合、ブラウザのマイク許可が必要です。
 
-`Chunk seconds` を短くすると表示までの待ち時間は短くなりますが、推論回数が増えます。まずは `4` 秒から始める想定です。
+ライブ認識はブラウザ側で音量を見ながら、発話後の短い無音または最大長に達した時点で自動的に区切ります。無音だけのチャンクや空の認識結果は `Transcript` に表示しません。
 
 ## CLI Usage
 
-GUI と同じ Moonshine 処理を CLI からも実行できます。
+GUI と同じ ASR バックエンドを CLI からも実行できます。
 
 マイク録音:
 
@@ -84,17 +84,16 @@ python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duratio
 
 ## Device Policy
 
-この Moonshine バックエンドは、Intel NPU/GPU では OpenVINO / Optimum Intel、それ以外では Hugging Face Transformers / PyTorch を使います。
+Qwen3-ASR JA は、Intel NPU/GPU では OpenVINO 変換済みモデル、それ以外では `qwen-asr` を使います。認識時は `qwen-asr` の正規言語名である `Japanese` を明示して実行します。
 
 ```text
-auto | intel_npu | intel_gpu | cpu | gpu
+auto | intel_npu | intel_gpu | cpu
 ```
 
-- `auto`: Intel NPU が使える場合は OpenVINO NPU、なければ OpenVINO GPU、なければ CUDA、なければ CPU
+- `auto`: Intel NPU が使える場合は OpenVINO NPU、なければ OpenVINO GPU、なければ CPU
 - `intel_npu`: OpenVINO の `NPU`
 - `intel_gpu`: OpenVINO の `GPU`
 - `cpu`: PyTorch CPU
-- `gpu`: CUDA GPU
 
 GUI の `Device` は起動時に利用可能なデバイスを確認して更新します。使えないデバイスは `unavailable` として無効表示されます。
 
@@ -121,8 +120,12 @@ RTF = total_processing_time_seconds / audio_duration_seconds
 ## Notes
 
 - `cache/` は `.gitignore` 対象です。モデルキャッシュはリポジトリに含めません。
-- ブラウザGUIのマイク入力は、ブラウザ側で録音した音声を 16 kHz WAV のチャンクにしてバックエンドへ送ります。
-- サーバ側では同じモデルとデバイスの Moonshine runner をキャッシュし、リアルタイム処理中の再ロードを避けます。
-- Intel NPU/GPU 初回実行では Moonshine を OpenVINO IR に変換し、`cache\openvino` に保存します。
-- 現在の Optimum Intel は Moonshine の OpenVINO export を公式サポートしていないため、Intel NPU/GPU が空文字を返した有音チャンクは CPU runner でフォールバック認識します。
-- CLI の `--mic` は Python の `sounddevice` を使った固定秒数録音です。リアルタイム操作はブラウザGUIを使います。
+- ブラウザ GUI のマイク入力は、ブラウザ側で録音した音声を発話と無音に応じた 16 kHz WAV チャンクにしてバックエンドへ送ります。
+- サーバ側では同じモデルとデバイスの ASR runner をキャッシュし、リアルタイム処理中の再ロードを避けます。
+- Intel NPU/GPU 初回実行ではモデルを OpenVINO IR に変換し、`cache\openvino` に保存します。
+- 認識対象は日本語音声です。日本語以外の音声は精度保証の対象外です。
+- CLI の `--mic` は Python の `sounddevice` を使った固定秒数録音です。リアルタイム操作はブラウザ GUI を使います。
+
+## Implementation Guide
+
+再実装に必要な設計、API、処理フローは [docs/implementation.md](docs/implementation.md) にまとめています。

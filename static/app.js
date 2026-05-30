@@ -8,10 +8,22 @@ const state = {
   processor: null,
   analyser: null,
   meterTimer: null,
-  chunkTimer: null,
   chunks: [],
+  chunkSampleCount: 0,
+  hasSpeech: false,
+  silenceMs: 0,
+  flushInProgress: false,
   submitChain: Promise.resolve(),
   chunkIndex: 0,
+};
+
+const chunking = {
+  speechRmsThreshold: 0.01,
+  submitRmsThreshold: 0.003,
+  minChunkMs: 700,
+  trailingSilenceMs: 650,
+  maxChunkMs: 7000,
+  idleDropMs: 2000,
 };
 
 const els = {
@@ -26,111 +38,15 @@ const els = {
   transcript: document.querySelector("#transcript"),
   metrics: document.querySelector("#metrics"),
   deviceStatus: document.querySelector("#deviceStatus"),
-  modelChoices: document.querySelector("#modelChoices"),
   modelInput: document.querySelector("#model"),
-  customModelInput: document.querySelector("#customModel"),
-  customModelField: document.querySelector("#customModelField"),
 };
 
 els.startLiveButton.addEventListener("click", startLive);
 els.stopLiveButton.addEventListener("click", stopLive);
 els.clearButton.addEventListener("click", clearOutput);
-els.modelChoices.addEventListener("click", handleModelButtonClick);
-els.customModelInput.addEventListener("input", handleCustomModelInput);
 document.querySelector("#device").addEventListener("change", resetWarmup);
 
-updateCustomModelVisibility();
-loadModels();
 loadDevices();
-
-async function loadModels() {
-  try {
-    const response = await fetch("/api/models");
-    const data = await response.json();
-    updateModelSelect(data.models || []);
-  } catch {
-    updateModelSelect([]);
-  }
-}
-
-function updateModelSelect(models) {
-  if (!models.length) {
-    return;
-  }
-
-  const currentValue = getSelectedModel();
-  els.modelChoices.innerHTML = "";
-
-  for (const model of models) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "model-option";
-    button.dataset.model = model.value;
-    button.textContent = model.label;
-    button.title = model.description || model.value;
-    els.modelChoices.appendChild(button);
-  }
-
-  const customButton = document.createElement("button");
-  customButton.type = "button";
-  customButton.className = "model-option";
-  customButton.dataset.model = "custom";
-  customButton.textContent = "Custom";
-  customButton.title = "Custom model id or directory";
-  els.modelChoices.appendChild(customButton);
-
-  const knownModel = models.find((model) => model.value === currentValue);
-  selectModelButton(knownModel ? knownModel.value : "custom");
-  if (!knownModel) {
-    els.customModelInput.value = currentValue;
-  }
-  setSelectedModel(currentValue);
-}
-
-function handleModelButtonClick(event) {
-  const button = event.target.closest(".model-option");
-  if (!button) {
-    return;
-  }
-
-  selectModelButton(button.dataset.model);
-  if (button.dataset.model !== "custom") {
-    setSelectedModel(button.dataset.model);
-  } else {
-    setSelectedModel(els.customModelInput.value.trim());
-  }
-  loadDevices();
-  resetWarmup();
-}
-
-function handleCustomModelInput() {
-  if (getActiveModelChoice() === "custom") {
-    setSelectedModel(els.customModelInput.value.trim());
-    loadDevices();
-    resetWarmup();
-  }
-}
-
-function selectModelButton(modelValue) {
-  for (const button of els.modelChoices.querySelectorAll(".model-option")) {
-    const isActive = button.dataset.model === modelValue;
-    button.classList.toggle("active", isActive);
-    button.setAttribute("aria-pressed", String(isActive));
-  }
-  updateCustomModelVisibility();
-}
-
-function getActiveModelChoice() {
-  return els.modelChoices.querySelector(".model-option.active")?.dataset.model || els.modelInput.value;
-}
-
-function setSelectedModel(modelValue) {
-  els.modelInput.value = modelValue;
-}
-
-function updateCustomModelVisibility() {
-  els.customModelField.classList.toggle("hidden", getActiveModelChoice() !== "custom");
-}
 
 function getSelectedModel() {
   return els.modelInput.value.trim();
@@ -144,7 +60,7 @@ async function loadDevices() {
     const autoChoice = (data.choices || []).find((choice) => choice.value === "auto");
     els.deviceStatus.textContent = data.devices?.length
       ? `Device: ${autoChoice?.target || data.devices[0]}`
-      : "Moonshine devices unavailable";
+      : "ASR devices unavailable";
   } catch {
     els.deviceStatus.textContent = "device check failed";
   }
@@ -187,8 +103,7 @@ async function startLive() {
     state.processor = state.audioContext.createScriptProcessor(2048, 1, 1);
     state.analyser = state.audioContext.createAnalyser();
     state.analyser.fftSize = 256;
-    state.chunks = [];
-    state.chunkIndex = 0;
+    resetChunkState();
     state.submitChain = Promise.resolve();
 
     state.source.connect(state.analyser);
@@ -196,7 +111,7 @@ async function startLive() {
     state.processor.connect(state.audioContext.destination);
     state.processor.onaudioprocess = (event) => {
       if (state.liveRunning) {
-        state.chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+        collectAudioFrame(event.inputBuffer.getChannelData(0));
       }
     };
 
@@ -205,7 +120,6 @@ async function startLive() {
     els.liveLog.textContent = "listening";
     setBusy(false, "listening");
     startMeter();
-    state.chunkTimer = setInterval(flushLiveChunk, getChunkMs());
   } catch (error) {
     showError(error.message || String(error));
     await cleanupLive();
@@ -253,10 +167,7 @@ function resetWarmup() {
 
 function warmupNoticeText() {
   const model = getSelectedModel();
-  if (model.includes("Qwen3-ASR")) {
-    return `The first start downloads, converts, and warms up ${model}. Intel NPU/GPU uses OpenVINO IR saved under cache\\openvino.`;
-  }
-  return `The first start downloads and warms up ${model}. Intel NPU/GPU uses OpenVINO when supported and saves converted model files under cache\\openvino for faster startup after restart.`;
+  return `The first start downloads, converts, and warms up the Japanese model ${model}. Intel NPU/GPU uses OpenVINO IR saved under cache\\openvino.`;
 }
 
 async function stopLive() {
@@ -266,7 +177,6 @@ async function stopLive() {
 
   state.liveRunning = false;
   setBusy(true, "stopping");
-  clearInterval(state.chunkTimer);
   clearInterval(state.meterTimer);
   els.meterBar.style.width = "0%";
   els.stopLiveButton.disabled = true;
@@ -303,12 +213,14 @@ function startMeter() {
 }
 
 async function flushLiveChunk() {
-  if (!state.chunks.length || !state.audioContext) {
+  if (!state.chunks.length || !state.audioContext || state.flushInProgress) {
     return;
   }
 
+  state.flushInProgress = true;
   const chunks = state.chunks;
-  state.chunks = [];
+  resetChunkState();
+  state.flushInProgress = false;
   const chunkNumber = state.chunkIndex + 1;
   state.chunkIndex = chunkNumber;
   const merged = mergeFloat32(chunks);
@@ -321,9 +233,9 @@ async function flushLiveChunk() {
   const blob = new Blob([wav], { type: "audio/wav" });
 
   state.submitChain = state.submitChain.catch(() => {}).then(async () => {
-    els.liveLog.textContent = `transcribing chunk ${chunkNumber}`;
+    els.liveLog.textContent = "transcribing";
     const data = await submitAudio(blob, `live-${chunkNumber}.wav`, { keepBusy: true });
-    appendLiveResult(data, chunkNumber);
+    appendLiveResult(data);
     els.liveLog.textContent = state.liveRunning ? "listening" : "stopped";
   });
   await state.submitChain.catch((error) => showError(error.message || String(error)));
@@ -352,25 +264,42 @@ function buildFormData() {
   const formData = new FormData();
   formData.append("model", getSelectedModel());
   formData.append("device", document.querySelector("#device").value);
-  formData.append("max_new_tokens", document.querySelector("#maxTokens").value);
-  formData.append("duration", document.querySelector("#duration").value);
   return formData;
 }
 
-function appendLiveResult(data, chunkNumber) {
+function appendLiveResult(data) {
   els.transcript.classList.remove("error");
-  const text = data.text?.trim();
+  const text = extractAsrText(data.text);
   if (text) {
-    els.transcript.textContent += `${els.transcript.textContent ? "\n" : ""}[${chunkNumber}] ${text}`;
+    els.transcript.textContent += `${els.transcript.textContent ? "\n" : ""}${text}`;
     els.transcript.scrollTop = els.transcript.scrollHeight;
+    renderMetrics(data, "latest");
   }
-  renderMetrics(data, `chunk ${chunkNumber}`);
+}
+
+function extractAsrText(rawText) {
+  let text = String(rawText || "").trim();
+  if (!text) {
+    return "";
+  }
+
+  const asrTag = "<asr_text>";
+  const tagIndex = text.indexOf(asrTag);
+  if (tagIndex >= 0) {
+    text = text.slice(tagIndex + asrTag.length);
+  }
+
+  return text
+    .replace(/<\/?asr_text>/gi, "")
+    .replace(/^language\s+\S+\s*/i, "")
+    .replace(/<\|[^|]+?\|>/g, "")
+    .trim();
 }
 
 function renderMetrics(data, label) {
   const benchmark = data.benchmark || {};
   els.metrics.innerHTML = [
-    metric("source", label),
+    metric("status", label),
     metric("device", data.fallback_device ? `${data.selected_device} + ${data.fallback_device}` : data.selected_device),
     metric("audio sec", formatNumber(benchmark.audio_duration_seconds)),
     metric("rtf", benchmark.rtf == null ? "n/a" : formatNumber(benchmark.rtf)),
@@ -407,11 +336,6 @@ function setBusy(isBusy, status) {
   els.stopLiveButton.disabled = !state.liveRunning;
 }
 
-function getChunkMs() {
-  const seconds = Number(document.querySelector("#duration").value || 1);
-  return Math.max(500, seconds * 1000);
-}
-
 function mergeFloat32(chunks) {
   const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
   const merged = new Float32Array(length);
@@ -421,6 +345,45 @@ function mergeFloat32(chunks) {
     offset += chunk.length;
   }
   return merged;
+}
+
+function collectAudioFrame(input) {
+  const frame = new Float32Array(input);
+  state.chunks.push(frame);
+  state.chunkSampleCount += frame.length;
+
+  const sampleRate = state.audioContext.sampleRate;
+  const frameMs = (frame.length / sampleRate) * 1000;
+  const chunkMs = (state.chunkSampleCount / sampleRate) * 1000;
+  const frameRms = audioRms(frame);
+
+  if (frameRms >= chunking.speechRmsThreshold) {
+    state.hasSpeech = true;
+    state.silenceMs = 0;
+  } else if (state.hasSpeech) {
+    state.silenceMs += frameMs;
+  }
+
+  const endedBySilence =
+    state.hasSpeech &&
+    chunkMs >= chunking.minChunkMs &&
+    state.silenceMs >= chunking.trailingSilenceMs;
+  const endedByMaxLength = state.hasSpeech && chunkMs >= chunking.maxChunkMs;
+  if (endedBySilence || endedByMaxLength) {
+    void flushLiveChunk();
+    return;
+  }
+
+  if (!state.hasSpeech && chunkMs >= chunking.idleDropMs) {
+    resetChunkState();
+  }
+}
+
+function resetChunkState() {
+  state.chunks = [];
+  state.chunkSampleCount = 0;
+  state.hasSpeech = false;
+  state.silenceMs = 0;
 }
 
 function resampleLinear(input, fromRate, toRate) {

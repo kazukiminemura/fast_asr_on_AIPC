@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import importlib
 import json
+import re
 import sys
 import tempfile
 import time
@@ -13,18 +14,13 @@ from typing import Any
 
 
 DEFAULT_MODEL = "neosophie/Qwen3-ASR-1.7B-JA"
-QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
-QWEN3_ASR_MODELS = {DEFAULT_MODEL, QWEN3_ASR_MODEL}
+JAPANESE_LANGUAGE = "Japanese"
+QWEN3_ASR_MODELS = {DEFAULT_MODEL}
 MODEL_CHOICES = [
     {
         "value": DEFAULT_MODEL,
-        "label": "Qwen3-ASR JA",
-        "description": "Japanese ASR via qwen-asr / OpenVINO",
-    },
-    {
-        "value": QWEN3_ASR_MODEL,
-        "label": "Qwen3-ASR 1.7B",
-        "description": "Multilingual ASR via qwen-asr",
+        "label": "Japanese",
+        "description": "Japanese ASR with Qwen3-ASR JA via qwen-asr / OpenVINO",
     },
 ]
 HF_CACHE_DIR = Path("cache") / "huggingface"
@@ -34,7 +30,6 @@ DEVICE_ALIASES = {
     "intel_npu": "OPENVINO_NPU",
     "npu": "OPENVINO_NPU",
     "intel_gpu": "OPENVINO_GPU",
-    "gpu": "CUDA",
     "cpu": "CPU",
 }
 RUNNER_CACHE: dict[tuple[str, str], Any] = {}
@@ -195,7 +190,7 @@ class Qwen3AsrRunner:
             self.soundfile.write(str(temp_audio_path), raw_speech, 16000)
             results = self.model.transcribe(
                 audio=str(temp_audio_path),
-                language=None,
+                language=JAPANESE_LANGUAGE,
             )
             if not results:
                 return ""
@@ -239,7 +234,7 @@ class OpenVINOQwen3AsrRunner:
             self.soundfile.write(str(temp_audio_path), raw_speech, 16000)
             results = self.model.transcribe(
                 audio=str(temp_audio_path),
-                language=None,
+                language=JAPANESE_LANGUAGE,
             )
             if not results:
                 return ""
@@ -256,12 +251,12 @@ def parse_args() -> argparse.Namespace:
         "--device",
         choices=tuple(DEVICE_ALIASES),
         default="auto",
-        help="Inference device. auto prefers Intel NPU, then Intel GPU, then CUDA, then CPU.",
+        help="Inference device. auto prefers Intel NPU, then Intel GPU, then CPU.",
     )
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help="Hugging Face model id or local model directory.",
+        help="Japanese ASR model id or local model directory.",
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
@@ -314,7 +309,6 @@ def require_dependency(module_name: str, package_name: str) -> Any:
 
 
 def available_devices() -> list[str]:
-    torch = require_dependency("torch", "torch")
     devices = ["CPU"]
     try:
         openvino = require_dependency("openvino", "openvino")
@@ -326,14 +320,11 @@ def available_devices() -> list[str]:
             devices.insert(insert_at, "OPENVINO_GPU")
     except SystemExit:
         pass
-    if torch.cuda.is_available():
-        insert_at = sum(1 for device in devices if device.startswith("OPENVINO_"))
-        devices.insert(insert_at, "CUDA")
     return devices
 
 
 def auto_device_target(devices: list[str]) -> str:
-    for candidate in ("OPENVINO_NPU", "OPENVINO_GPU", "CUDA", "CPU"):
+    for candidate in ("OPENVINO_NPU", "OPENVINO_GPU", "CPU"):
         if candidate in devices:
             return candidate
     return "CPU"
@@ -378,12 +369,6 @@ def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
                 "available": "CPU" in devices,
                 "target": "CPU",
             },
-            {
-                "value": "gpu",
-                "label": "GPU (CUDA)",
-                "available": "CUDA" in devices,
-                "target": "CUDA",
-            },
         ]
 
     auto_target = auto_device_target(devices)
@@ -411,12 +396,6 @@ def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
             "label": "CPU",
             "available": "CPU" in devices,
             "target": "CPU",
-        },
-        {
-            "value": "gpu",
-            "label": "GPU (CUDA)",
-            "available": "CUDA" in devices,
-            "target": "CUDA",
         },
     ]
 
@@ -571,7 +550,7 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     inference_seconds = time.perf_counter() - inference_start
 
     postprocess_start = time.perf_counter()
-    text = text.strip()
+    text = extract_asr_text(text)
     postprocess_seconds = time.perf_counter() - postprocess_start
 
     total_seconds = (
@@ -612,6 +591,21 @@ def audio_rms(raw_speech: list[float]) -> float:
         return 0.0
     square_sum = sum(sample * sample for sample in raw_speech)
     return (square_sum / len(raw_speech)) ** 0.5
+
+
+def extract_asr_text(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+
+    asr_tag = "<asr_text>"
+    if asr_tag in text:
+        text = text.split(asr_tag, 1)[1]
+
+    text = re.sub(r"</?asr_text>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^language\s+\S+\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\|[^|]+?\|>", "", text)
+    return text.strip()
 
 
 def print_human_output(payload: dict[str, Any], show_benchmark: bool) -> None:

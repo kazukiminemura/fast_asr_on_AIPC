@@ -8,98 +8,57 @@
   </head>
   <body>
     <main class="app-shell">
-      <section class="control-panel">
-        <div class="brand">
-          <div>
-            <h1>AIPC ASR</h1>
-            <p>Qwen3-ASR Japanese recognition</p>
-          </div>
-          <span id="deviceStatus" class="status">checking devices</span>
+      <header class="topbar">
+        <div>
+          <h1>AIPC ASR</h1>
+          <p>Japanese live transcription</p>
+        </div>
+        <span id="deviceStatus" class="status">checking devices</span>
+      </header>
+
+      <section class="controls" aria-label="Live transcription controls">
+        <input id="model" name="model" type="hidden" value="neosophie/Qwen3-ASR-1.7B-JA" />
+
+        <label class="device-field">
+          <span>Device</span>
+          <select id="device" name="device">
+            <option value="auto">auto</option>
+            <option value="intel_npu">intel npu</option>
+            <option value="intel_gpu">intel gpu</option>
+            <option value="cpu">cpu</option>
+          </select>
+        </label>
+
+        <div class="button-row">
+          <button id="startLiveButton" class="primary" type="button">Start</button>
+          <button id="stopLiveButton" type="button" disabled>Stop</button>
+          <button id="clearButton" type="button">Clear</button>
         </div>
 
-        <form id="asrForm" class="form-grid">
-          <div class="field wide">
-            <span>Model</span>
-            <div id="modelChoices" class="model-buttons">
-              <button class="model-option active" type="button" data-model="neosophie/Qwen3-ASR-1.7B-JA" aria-pressed="true">
-                Qwen3-ASR JA
-              </button>
-              <button class="model-option" type="button" data-model="Qwen/Qwen3-ASR-1.7B" aria-pressed="false">
-                Qwen3-ASR 1.7B
-              </button>
-              <button class="model-option" type="button" data-model="custom" aria-pressed="false">
-                Custom
-              </button>
-            </div>
-            <input id="model" name="model" type="hidden" value="neosophie/Qwen3-ASR-1.7B-JA" />
-          </div>
+        <div class="meter" aria-hidden="true">
+          <div id="meterBar"></div>
+        </div>
 
-          <label id="customModelField" class="field wide hidden">
-            <span>Custom model id or directory</span>
-            <input
-              id="customModel"
-              name="custom_model"
-              type="text"
-              value="neosophie/Qwen3-ASR-1.7B-JA"
-              autocomplete="off"
-              required
-            />
-          </label>
-
-          <label class="field">
-            <span>Device</span>
-            <select id="device" name="device">
-              <option value="auto">auto</option>
-              <option value="intel_npu">intel npu</option>
-              <option value="intel_gpu">intel gpu</option>
-              <option value="cpu">cpu</option>
-              <option value="gpu">gpu</option>
-            </select>
-          </label>
-
-          <label class="field">
-            <span>Max tokens</span>
-            <input id="maxTokens" name="max_new_tokens" type="number" value="64" min="8" max="256" />
-          </label>
-
-          <label class="field">
-            <span>Chunk seconds</span>
-            <input id="duration" name="duration" type="number" value="1" min="0.5" max="10" step="0.5" />
-          </label>
-
-        </form>
+        <span id="runStatus" class="status">idle</span>
       </section>
+
+      <div id="warmupNotice" class="warmup-notice">
+        First start may take a while while the Japanese model is downloaded, converted, and warmed up.
+      </div>
 
       <section class="workspace">
-        <div class="input-pane">
-          <div class="source-title">Live microphone</div>
-          <div id="warmupNotice" class="warmup-notice">
-            The first start downloads, converts, and warms up neosophie/Qwen3-ASR-1.7B-JA. It can take a while.
-            Intel NPU/GPU uses OpenVINO IR saved under cache\openvino for faster startup after restart.
-          </div>
-
-          <div id="micPane" class="pane active">
-            <div class="meter">
-              <div id="meterBar"></div>
-            </div>
-            <div class="button-row">
-              <button id="startLiveButton" class="primary" type="button">Start Live</button>
-              <button id="stopLiveButton" type="button" disabled>Stop</button>
-              <button id="clearButton" type="button">Clear</button>
-            </div>
-            <div id="liveLog" class="live-log">waiting</div>
-          </div>
-        </div>
-
-        <div class="output-pane">
+        <section class="transcript-pane" aria-label="Transcript">
           <div class="output-header">
             <h2>Transcript</h2>
-            <span id="runStatus">idle</span>
+            <span id="liveLog">waiting</span>
           </div>
           <pre id="transcript"></pre>
-          <div id="metrics" class="metrics"></div>
-        </div>
+        </section>
+
+        <aside id="metrics" class="metrics" aria-label="Latest metrics"></aside>
       </section>
+
+      <div id="micPane" class="hidden"></div>
     </main>
 
     <script src="/static/app.js"></script>

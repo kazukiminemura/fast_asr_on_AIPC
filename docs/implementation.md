@@ -7,8 +7,8 @@
 AIPC 上で日本語音声認識を低遅延に試せる、ブラウザ GUI 付きのローカル ASR アプリを作る。
 
 - ブラウザでマイク音声を録音する
-- 音声を短いチャンクに分割してサーバーへ送る
-- サーバー側で Qwen3-ASR を実行する
+- 音声を発話と無音に合わせた動的チャンクに分割してサーバーへ送る
+- サーバー側で日本語向け Qwen3-ASR を実行する
 - Intel NPU/GPU がある場合は OpenVINO を優先する
 - 認識結果と RTF をチャンクごとに画面へ追記する
 - 初回ロード後はモデルと OpenVINO IR を `cache/` に保存する
@@ -96,13 +96,9 @@ python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duratio
 neosophie/Qwen3-ASR-1.7B-JA
 ```
 
-GUI では以下を選べる。
+GUI は日本語認識に特化し、このモデルを固定で使う。
 
-- `neosophie/Qwen3-ASR-1.7B-JA`: 日本語向け Qwen3-ASR
-- `Qwen/Qwen3-ASR-1.7B`: 多言語 Qwen3-ASR
-- `Custom`: Hugging Face model id またはローカルモデルディレクトリ
-
-`main.py` では `DEFAULT_MODEL`, `QWEN3_ASR_MODEL`, `MODEL_CHOICES` で定義する。
+`main.py` では `DEFAULT_MODEL`, `JAPANESE_LANGUAGE`, `MODEL_CHOICES` で定義する。`JAPANESE_LANGUAGE` は `qwen-asr` の正規言語名 `Japanese` で、Qwen3-ASR の `transcribe()` 呼び出しへ明示的に渡す。
 
 ## 全体アーキテクチャ
 
@@ -151,26 +147,25 @@ GUI/CLI の入力値は `DEVICE_ALIASES` で内部表現へ変換する。
 auto      -> AUTO
 intel_npu -> OPENVINO_NPU
 intel_gpu -> OPENVINO_GPU
-gpu       -> CUDA
 cpu       -> CPU
 ```
 
 `auto` の優先順は次。
 
 ```text
-OPENVINO_NPU -> OPENVINO_GPU -> CUDA -> CPU
+OPENVINO_NPU -> OPENVINO_GPU -> CPU
 ```
 
 OpenVINO の実デバイス名へ渡すときは、`OPENVINO_NPU` を `NPU`、`OPENVINO_GPU` を `GPU` に変換する。
 
 ### Runner の種類
 
-`get_moonshine_runner(model_ref, device)` がモデルとデバイスに応じて Runner を選ぶ。関数名に Moonshine が残っているが、現行の既定モデルは Qwen3-ASR。
+`get_moonshine_runner(model_ref, device)` がモデルとデバイスに応じて Runner を選ぶ。関数名に Moonshine が残っているが、GUI の実行対象は日本語向け Qwen3-ASR。
 
 - `Qwen3AsrRunner`: Qwen3-ASR を `qwen-asr` で実行する
 - `OpenVINOQwen3AsrRunner`: Qwen3-ASR を `third_party.qwen_3_asr_helper` で OpenVINO IR に変換して実行する
-- `MoonshineRunner`: Transformers の `AutoModelForSpeechSeq2Seq` で実行する汎用 Runner
-- `OpenVINOMoonshineRunner`: Optimum Intel の `OVModelForSpeechSeq2Seq` で実行する汎用 OpenVINO Runner
+- `MoonshineRunner`: CLI から Qwen3-ASR 以外を試す場合の汎用 Runner
+- `OpenVINOMoonshineRunner`: CLI から Qwen3-ASR 以外を OpenVINO で試す場合の汎用 Runner
 
 選択ルール。
 
@@ -221,7 +216,7 @@ Hugging Face のモデルファイルは `cache/huggingface` に保存する。O
   "models": [
     {
       "value": "neosophie/Qwen3-ASR-1.7B-JA",
-      "label": "Qwen3-ASR JA",
+      "label": "Japanese",
       "description": "Japanese ASR via qwen-asr / OpenVINO"
     }
   ]
@@ -284,9 +279,7 @@ Hugging Face のモデルファイルは `cache/huggingface` に保存する。O
 
 ```text
 model: Hugging Face model id またはローカルモデルディレクトリ
-device: auto | intel_npu | intel_gpu | cpu | gpu
-max_new_tokens: 生成トークン上限
-duration: GUI 上のチャンク秒数
+device: auto | intel_npu | intel_gpu | cpu
 audio: WAV などの音声ファイル
 ```
 
@@ -320,16 +313,12 @@ audio: WAV などの音声ファイル
 
 `static/index.html` は単一画面の操作 UI を持つ。
 
-- モデル選択
-- カスタムモデル入力
 - デバイス選択
-- Max tokens
-- Chunk seconds
-- Start Live / Stop / Clear
+- Start / Stop / Clear
 - 音量メーター
-- チャンクごとのログ
+- 状態表示
 - Transcript
-- メトリクス表示
+- 最新メトリクス表示
 
 `static/app.js` は状態を `state` オブジェクトにまとめる。
 
@@ -345,8 +334,11 @@ audio: WAV などの音声ファイル
   processor: null,
   analyser: null,
   meterTimer: null,
-  chunkTimer: null,
   chunks: [],
+  chunkSampleCount: 0,
+  hasSpeech: false,
+  silenceMs: 0,
+  flushInProgress: false,
   submitChain: Promise.resolve(),
   chunkIndex: 0
 }
@@ -359,22 +351,30 @@ audio: WAV などの音声ファイル
 3. `navigator.mediaDevices.getUserMedia({ audio: true })` でマイク許可を取る
 4. `AudioContext` を作る
 5. `MediaStreamSource -> Analyser -> ScriptProcessor -> destination` を接続する
-6. `onaudioprocess` で Float32 PCM を `state.chunks` に積む
-7. `setInterval(flushLiveChunk, Chunk seconds)` でチャンク送信する
+6. `onaudioprocess` で Float32 PCM を `collectAudioFrame()` に渡す
+7. RMS で発話開始と無音継続を判定し、動的に `flushLiveChunk()` を呼ぶ
 8. `Stop` 時に最後のチャンクを送信し、録音リソースを解放する
 
 ### チャンク処理
 
+`collectAudioFrame()` の処理。
+
+1. 入力 frame を `state.chunks` に積み、サンプル数を加算する
+2. frame の RMS が `speechRmsThreshold` 以上なら発話中とみなす
+3. 発話後に `trailingSilenceMs` 以上の無音が続いたらチャンクを送る
+4. 発話が長く続いた場合は `maxChunkMs` で強制的にチャンクを送る
+5. 発話がないまま `idleDropMs` を超えた音声は捨てて、無音だけの送信を避ける
+
 `flushLiveChunk()` の処理。
 
-1. `state.chunks` を取り出して空にする
+1. `state.chunks` を取り出してチャンク状態をリセットする
 2. `mergeFloat32()` で連結する
 3. `resampleLinear()` でブラウザの sample rate から 16 kHz へ変換する
-4. `audioRms()` が `0.003` 未満なら無音として捨てる
+4. `audioRms()` が `submitRmsThreshold` 未満なら無音として捨てる
 5. `encodeWav()` で 16-bit PCM WAV にする
 6. `submitAudio()` で `POST /api/transcribe` へ送る
-7. `appendLiveResult()` で `[chunk番号] テキスト` を追記する
-8. `renderMetrics()` で RTF や推論時間を更新する
+7. `appendLiveResult()` で `asr_text` の本文だけを追記する
+8. 本文がある場合だけ `renderMetrics()` で RTF や推論時間を更新する
 
 `submitChain` で送信を直列化する。チャンクの推論が重なって Runner を同時に叩かないようにするため。
 
@@ -387,7 +387,7 @@ audio: WAV などの音声ファイル
 3. `select_model_device()` で要求デバイスを実デバイスに決める
 4. `get_moonshine_runner()` で Runner を取得または作成する
 5. `--mic` なら `read_microphone_16khz()`、`--audio` なら `read_audio_16khz()` で 16 kHz mono にする
-6. `runner.transcribe(raw_speech, max_new_tokens)` を呼ぶ
+6. `runner.transcribe(raw_speech, 64)` を呼ぶ
 7. 必要なら fallback を行う
 8. `BenchmarkResult` を作る
 9. Web/CLI 共通の payload を返す
@@ -418,12 +418,11 @@ rtf = total_processing_seconds / audio_duration_seconds
 
 `Qwen3AsrRunner` は `qwen_asr.Qwen3ASRModel.from_pretrained()` を使う。
 
-- CUDA の場合は `device_map="cuda:0"`、`dtype=torch.bfloat16`
-- その他は `device_map="cpu"`、`dtype=torch.float32`
+- `device_map="cpu"`、`dtype=torch.float32`
 - `max_inference_batch_size=1`
 - `max_new_tokens=64`
 
-`qwen-asr` はファイルパスを入力に取るため、`transcribe()` では一時 WAV を作る。
+`qwen-asr` はファイルパスを入力に取るため、`transcribe()` では一時 WAV を作る。日本語特化のため、`model.transcribe(..., language="Japanese")` を指定する。
 
 ```text
 raw_speech list[float] -> temp .wav at 16 kHz -> model.transcribe(audio=...)
@@ -441,14 +440,13 @@ raw_speech list[float] -> temp .wav at 16 kHz -> model.transcribe(audio=...)
 
 ## 汎用 SpeechSeq2Seq 実行
 
-Qwen3-ASR 以外のモデルを Custom で指定した場合に使う。
+GUI では使わない。CLI から Qwen3-ASR 以外のモデルを指定した場合の互換経路として残す。
 
 ### PyTorch
 
 `MoonshineRunner` は `AutoProcessor` と `AutoModelForSpeechSeq2Seq` をロードする。
 
-- CUDA の場合は `cuda:0` と `float16`
-- その他は `cpu` と `float32`
+- `cpu` と `float32`
 - `processor(..., sampling_rate=...)` で入力を作る
 - `model.generate(**inputs, max_length=max_length)` で生成する
 - `processor.decode(..., skip_special_tokens=True)` で文字列化する
@@ -518,7 +516,7 @@ python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.
 ## 注意点
 
 - 初回はモデルダウンロードと OpenVINO 変換で時間がかかる
-- OpenVINO NPU/GPU がない環境では `auto` は CUDA または CPU へ落ちる
+- OpenVINO NPU/GPU がない環境では `auto` は CPU へ落ちる
 - ブラウザのマイク利用には `http://127.0.0.1` または HTTPS が必要
 - GUI のマイク録音はブラウザ側で行う。CLI の `--mic` は `sounddevice` で固定秒数だけ録音する別経路
 - `ScriptProcessorNode` は古い API だが、現行実装では簡単さを優先して使っている
