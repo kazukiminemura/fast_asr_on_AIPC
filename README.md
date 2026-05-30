@@ -38,7 +38,7 @@ neosophie/Qwen3-ASR-1.7B-JA
 ## Run GUI
 
 ```powershell
-python web_app.py
+.\.venv\Scripts\python.exe web_app.py
 ```
 
 ブラウザで開きます。
@@ -50,7 +50,7 @@ http://127.0.0.1:8000
 別ポートで起動する場合:
 
 ```powershell
-python web_app.py --port 8080
+.\.venv\Scripts\python.exe web_app.py --port 8080
 ```
 
 ## GUI Usage
@@ -73,13 +73,13 @@ GUI と同じ ASR バックエンドを CLI からも実行できます。
 マイク録音:
 
 ```powershell
-python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark
+.\.venv\Scripts\python.exe main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark
 ```
 
 JSON 出力:
 
 ```powershell
-python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark --json
+.\.venv\Scripts\python.exe main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark --json
 ```
 
 ## Device Policy

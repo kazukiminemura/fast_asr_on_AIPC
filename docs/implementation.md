@@ -38,7 +38,7 @@ Main packages:
 torch
 transformers
 accelerate
-openvino
+openvino>=2026.2
 optimum-intel[openvino]
 librosa
 soundfile
@@ -61,7 +61,7 @@ Roles:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python web_app.py
+.\.venv\Scripts\python.exe web_app.py
 ```
 
 Open:
@@ -73,8 +73,31 @@ http://127.0.0.1:8000
 CLI examples:
 
 ```powershell
-python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.wav --benchmark
-python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark --json
+.\.venv\Scripts\python.exe main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.wav --benchmark
+.\.venv\Scripts\python.exe main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark --json
+```
+
+Always start the app with the same Python environment that installed `requirements.txt`.
+On Windows, prefer `.\.venv\Scripts\python.exe ...` in commands even after activation.
+If the app is launched with the Microsoft Store/global `python`, `third_party/qwen_3_asr_helper.py`
+can exist but still fail to import because `qwen_asr` is missing from that interpreter. That failure
+may surface as:
+
+```text
+OpenVINO Qwen3-ASR helper is missing. Expected third_party/qwen_3_asr_helper.py.
+```
+
+When this appears, first confirm which interpreter is running:
+
+```powershell
+python -c "import sys; print(sys.executable)"
+.\.venv\Scripts\python.exe -c "import qwen_asr; print(qwen_asr.__file__)"
+```
+
+Then restart with:
+
+```powershell
+.\.venv\Scripts\python.exe web_app.py
 ```
 
 ## Architecture
@@ -402,7 +425,7 @@ rtf = total_processing_seconds / audio_duration_seconds
 Python syntax:
 
 ```powershell
-python -m py_compile main.py web_app.py third_party/qwen_3_asr_helper.py
+.\.venv\Scripts\python.exe -m py_compile main.py web_app.py third_party/qwen_3_asr_helper.py
 ```
 
 Device API:
@@ -414,7 +437,7 @@ Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8000/api/devices?model=neos
 CLI:
 
 ```powershell
-python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.wav --benchmark --json
+.\.venv\Scripts\python.exe main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --audio sample.wav --benchmark --json
 ```
 
 Browser:

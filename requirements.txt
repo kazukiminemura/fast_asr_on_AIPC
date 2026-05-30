@@ -1,7 +1,7 @@
 torch>=2.3
 transformers>=4.51
 accelerate>=0.30
-openvino>=2025.0
+openvino>=2026.2
 optimum-intel[openvino]>=1.21
 librosa>=0.10
 soundfile>=0.12
