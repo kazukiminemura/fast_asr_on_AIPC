@@ -8,7 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from main import available_devices, device_choices, run_asr, warmup_asr_model
+from main import DEFAULT_MODEL, available_devices, device_choices, model_choices, run_asr, warmup_asr_model
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +28,10 @@ class WebAsrHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_path = urlparse(self.path)
         if parsed_path.path == "/api/devices":
-            self.write_json(safe_device_payload())
+            self.write_json(safe_device_payload(parsed_path.query))
+            return
+        if parsed_path.path == "/api/models":
+            self.write_json({"models": model_choices()})
             return
         super().do_GET()
 
@@ -137,11 +140,19 @@ def parse_content_disposition(value: str) -> dict[str, str]:
     return items
 
 
-def safe_device_payload() -> dict:
+def safe_device_payload(query: str = "") -> dict:
     try:
+        model = ""
+        for item in query.split("&"):
+            key, separator, value = item.partition("=")
+            if separator and key == "model":
+                from urllib.parse import unquote_plus
+
+                model = unquote_plus(value).strip()
+                break
         return {
             "devices": available_devices(),
-            "choices": device_choices(),
+            "choices": device_choices(model or DEFAULT_MODEL),
         }
     except SystemExit:
         return {"devices": [], "choices": []}
@@ -174,7 +185,7 @@ def transcribe_form(
             input_device=None,
             benchmark=True,
             json=True,
-            max_new_tokens=int(fields.get("max_new_tokens", "128") or "128"),
+            max_new_tokens=int(fields.get("max_new_tokens", "64") or "64"),
         )
         payload, _benchmark = run_asr(args)
         return payload

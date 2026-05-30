@@ -12,19 +12,35 @@
         <div class="brand">
           <div>
             <h1>AIPC ASR</h1>
-            <p>Moonshine tiny Japanese ASR</p>
+            <p>Qwen3-ASR Japanese recognition</p>
           </div>
           <span id="deviceStatus" class="status">checking devices</span>
         </div>
 
         <form id="asrForm" class="form-grid">
-          <label class="field wide">
-            <span>Model directory</span>
+          <div class="field wide">
+            <span>Model</span>
+            <div id="modelChoices" class="model-buttons">
+              <button class="model-option active" type="button" data-model="neosophie/Qwen3-ASR-1.7B-JA" aria-pressed="true">
+                Qwen3-ASR JA
+              </button>
+              <button class="model-option" type="button" data-model="Qwen/Qwen3-ASR-1.7B" aria-pressed="false">
+                Qwen3-ASR 1.7B
+              </button>
+              <button class="model-option" type="button" data-model="custom" aria-pressed="false">
+                Custom
+              </button>
+            </div>
+            <input id="model" name="model" type="hidden" value="neosophie/Qwen3-ASR-1.7B-JA" />
+          </div>
+
+          <label id="customModelField" class="field wide hidden">
+            <span>Custom model id or directory</span>
             <input
-              id="model"
-              name="model"
+              id="customModel"
+              name="custom_model"
               type="text"
-              value="UsefulSensors/moonshine-tiny-ja"
+              value="neosophie/Qwen3-ASR-1.7B-JA"
               autocomplete="off"
               required
             />
@@ -42,12 +58,12 @@
 
           <label class="field">
             <span>Max tokens</span>
-            <input id="maxTokens" name="max_new_tokens" type="number" value="128" min="8" max="1024" />
+            <input id="maxTokens" name="max_new_tokens" type="number" value="64" min="8" max="256" />
           </label>
 
           <label class="field">
             <span>Chunk seconds</span>
-            <input id="duration" name="duration" type="number" value="4" min="1" max="30" step="1" />
+            <input id="duration" name="duration" type="number" value="1" min="0.5" max="10" step="0.5" />
           </label>
 
         </form>
@@ -57,8 +73,8 @@
         <div class="input-pane">
           <div class="source-title">Live microphone</div>
           <div id="warmupNotice" class="warmup-notice">
-            The first start downloads and warms up UsefulSensors/moonshine-tiny-ja. It can take a while.
-            Intel GPU uses OpenVINO and saves converted model files under cache\openvino for faster startup after restart.
+            The first start downloads, converts, and warms up neosophie/Qwen3-ASR-1.7B-JA. It can take a while.
+            Intel GPU uses OpenVINO IR saved under cache\openvino for faster startup after restart.
           </div>
 
           <div id="micPane" class="pane active">

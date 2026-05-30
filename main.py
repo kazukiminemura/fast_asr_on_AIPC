@@ -1,16 +1,32 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import json
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL = "UsefulSensors/moonshine-tiny-ja"
+DEFAULT_MODEL = "neosophie/Qwen3-ASR-1.7B-JA"
+QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+QWEN3_ASR_MODELS = {DEFAULT_MODEL, QWEN3_ASR_MODEL}
+MODEL_CHOICES = [
+    {
+        "value": DEFAULT_MODEL,
+        "label": "Qwen3-ASR JA",
+        "description": "Japanese ASR via qwen-asr / OpenVINO",
+    },
+    {
+        "value": QWEN3_ASR_MODEL,
+        "label": "Qwen3-ASR 1.7B",
+        "description": "Multilingual ASR via qwen-asr",
+    },
+]
 HF_CACHE_DIR = Path("cache") / "huggingface"
 OPENVINO_CACHE_DIR = Path("cache") / "openvino"
 DEVICE_ALIASES = {
@@ -20,6 +36,11 @@ DEVICE_ALIASES = {
     "cpu": "CPU",
 }
 RUNNER_CACHE: dict[tuple[str, str], Any] = {}
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 
 @dataclass
@@ -140,9 +161,94 @@ class OpenVINOMoonshineRunner:
         return self.processor.decode(generated_ids[0], skip_special_tokens=True).strip()
 
 
+class Qwen3AsrRunner:
+    def __init__(self, model_ref: str, device: str) -> None:
+        try:
+            qwen_asr = importlib.import_module("qwen_asr")
+        except ImportError as exc:
+            raise SystemExit(
+                f"{model_ref} requires the qwen-asr package. Install it with "
+                "`python -m pip install -U qwen-asr` and restart the app."
+            ) from exc
+
+        torch = require_dependency("torch", "torch")
+        self.model_ref = model_ref
+        self.device_name = device
+        self.soundfile = require_dependency("soundfile", "soundfile")
+        device_map = "cuda:0" if device == "CUDA" else "cpu"
+        dtype = torch.bfloat16 if device == "CUDA" else torch.float32
+        self.model = qwen_asr.Qwen3ASRModel.from_pretrained(
+            model_ref,
+            dtype=dtype,
+            device_map=device_map,
+            max_inference_batch_size=1,
+            max_new_tokens=64,
+        )
+
+    def transcribe(self, raw_speech: list[float], max_tokens: int) -> str:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            temp_audio_path = Path(temp_audio.name)
+
+        try:
+            self.soundfile.write(str(temp_audio_path), raw_speech, 16000)
+            results = self.model.transcribe(
+                audio=str(temp_audio_path),
+                language=None,
+            )
+            if not results:
+                return ""
+            return getattr(results[0], "text", "").strip()
+        finally:
+            temp_audio_path.unlink(missing_ok=True)
+
+
+class OpenVINOQwen3AsrRunner:
+    def __init__(self, model_ref: str, device: str) -> None:
+        try:
+            qwen3_asr_helper = importlib.import_module("third_party.qwen_3_asr_helper")
+        except ImportError as exc:
+            raise SystemExit(
+                "OpenVINO Qwen3-ASR helper is missing. Expected "
+                "third_party/qwen_3_asr_helper.py."
+            ) from exc
+
+        self.model_ref = model_ref
+        self.device_name = f"OPENVINO_{device}"
+        self.soundfile = require_dependency("soundfile", "soundfile")
+        ov_model_dir = OPENVINO_CACHE_DIR / sanitize_model_ref(model_ref)
+        with contextlib.redirect_stdout(sys.stderr):
+            qwen3_asr_helper.convert_qwen3_asr_model(
+                model_id=model_ref,
+                output_dir=ov_model_dir,
+                quantization_config=None,
+            )
+            self.model = qwen3_asr_helper.OVQwen3ASRModel.from_pretrained(
+                model_dir=str(ov_model_dir),
+                device=device,
+                max_inference_batch_size=1,
+                max_new_tokens=64,
+            )
+
+    def transcribe(self, raw_speech: list[float], max_tokens: int) -> str:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            temp_audio_path = Path(temp_audio.name)
+
+        try:
+            self.soundfile.write(str(temp_audio_path), raw_speech, 16000)
+            results = self.model.transcribe(
+                audio=str(temp_audio_path),
+                language=None,
+            )
+            if not results:
+                return ""
+            return getattr(results[0], "text", "").strip()
+        finally:
+            temp_audio_path.unlink(missing_ok=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Moonshine ASR with UsefulSensors/moonshine-tiny-ja.",
+        description=f"Run ASR with {DEFAULT_MODEL}.",
     )
     parser.add_argument(
         "--device",
@@ -189,7 +295,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=64,
         help="Maximum number of generated tokens.",
     )
     return parser.parse_args()
@@ -221,8 +327,38 @@ def available_devices() -> list[str]:
     return devices
 
 
-def device_choices() -> list[dict[str, Any]]:
+def device_choices(model_ref: str = DEFAULT_MODEL) -> list[dict[str, Any]]:
     devices = available_devices()
+    if is_qwen3_asr_model(model_ref):
+        auto_target = "OPENVINO_GPU" if "OPENVINO_GPU" in devices else "CUDA" if "CUDA" in devices else "CPU"
+        return [
+            {
+                "value": "auto",
+                "label": f"auto ({auto_target})",
+                "available": True,
+                "target": auto_target,
+            },
+            {
+                "value": "intel_gpu",
+                "label": "Intel GPU (OpenVINO)",
+                "available": "OPENVINO_GPU" in devices,
+                "target": "OPENVINO_GPU",
+                "reason": "Uses converted OpenVINO IR under cache/openvino.",
+            },
+            {
+                "value": "cpu",
+                "label": "CPU",
+                "available": "CPU" in devices,
+                "target": "CPU",
+            },
+            {
+                "value": "gpu",
+                "label": "GPU (CUDA)",
+                "available": "CUDA" in devices,
+                "target": "CUDA",
+            },
+        ]
+
     auto_target = "OPENVINO_GPU" if "OPENVINO_GPU" in devices else "CUDA" if "CUDA" in devices else "CPU"
     return [
         {
@@ -252,6 +388,15 @@ def device_choices() -> list[dict[str, Any]]:
     ]
 
 
+def model_choices() -> list[dict[str, str]]:
+    return MODEL_CHOICES
+
+
+def is_qwen3_asr_model(model_ref: str) -> bool:
+    model_ref = model_ref.strip()
+    return model_ref in QWEN3_ASR_MODELS or "Qwen3-ASR" in model_ref
+
+
 def select_device(requested: str, devices: list[str]) -> str:
     requested_device = DEVICE_ALIASES[requested]
     if requested_device == "AUTO":
@@ -265,6 +410,16 @@ def select_device(requested: str, devices: list[str]) -> str:
             f"Transformers Moonshine backend. Available devices: {available}"
         )
     return requested_device
+
+
+def select_model_device(model_ref: str, requested: str, devices: list[str]) -> str:
+    if is_qwen3_asr_model(model_ref):
+        if requested == "auto":
+            if "OPENVINO_GPU" in devices:
+                return "OPENVINO_GPU"
+            return "CUDA" if "CUDA" in devices else "CPU"
+    selected_device = select_device(requested, devices)
+    return selected_device
 
 
 def validate_inputs(model_ref: str, audio_path: Path | None) -> None:
@@ -323,7 +478,11 @@ def get_moonshine_runner(model_ref: str, device: str) -> tuple[Any, float]:
     HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     OPENVINO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     load_start = time.perf_counter()
-    if device == "OPENVINO_GPU":
+    if is_qwen3_asr_model(model_ref) and device == "OPENVINO_GPU":
+        runner = OpenVINOQwen3AsrRunner(model_ref, "GPU")
+    elif is_qwen3_asr_model(model_ref):
+        runner = Qwen3AsrRunner(model_ref, device)
+    elif device == "OPENVINO_GPU":
         runner = OpenVINOMoonshineRunner(model_ref, "GPU")
     else:
         runner = MoonshineRunner(model_ref, device)
@@ -335,10 +494,10 @@ def get_moonshine_runner(model_ref: str, device: str) -> tuple[Any, float]:
 def warmup_asr_model(model_ref: str, requested_device: str) -> dict[str, Any]:
     validate_inputs(model_ref, None)
     devices = available_devices()
-    selected_device = select_device(requested_device, devices)
+    selected_device = select_model_device(model_ref, requested_device, devices)
     _runner, model_load_seconds = get_moonshine_runner(model_ref, selected_device)
     fallback_load_seconds = 0.0
-    if selected_device == "OPENVINO_GPU":
+    if not is_qwen3_asr_model(model_ref) and selected_device == "OPENVINO_GPU":
         _fallback_runner, fallback_load_seconds = get_moonshine_runner(model_ref, "CPU")
     return {
         "model": model_ref,
@@ -348,7 +507,7 @@ def warmup_asr_model(model_ref: str, requested_device: str) -> dict[str, Any]:
         "model_load_seconds": model_load_seconds + fallback_load_seconds,
         "cache_hit": model_load_seconds == 0.0 and fallback_load_seconds == 0.0,
         "cache_dir": str(OPENVINO_CACHE_DIR if selected_device == "OPENVINO_GPU" else HF_CACHE_DIR),
-        "fallback_device": "CPU" if selected_device == "OPENVINO_GPU" else None,
+        "fallback_device": "CPU" if not is_qwen3_asr_model(model_ref) and selected_device == "OPENVINO_GPU" else None,
     }
 
 
@@ -357,7 +516,7 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
 
     device_start = time.perf_counter()
     devices = available_devices()
-    selected_device = select_device(args.device, devices)
+    selected_device = select_model_device(args.model, args.device, devices)
     device_selection_seconds = time.perf_counter() - device_start
 
     runner, model_load_seconds = get_moonshine_runner(args.model, selected_device)
@@ -374,7 +533,7 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     inference_start = time.perf_counter()
     text = runner.transcribe(raw_speech, args.max_new_tokens)
     fallback_device = None
-    if selected_device == "OPENVINO_GPU" and not text and audio_rms(raw_speech) > 0.001:
+    if not is_qwen3_asr_model(args.model) and selected_device == "OPENVINO_GPU" and not text and audio_rms(raw_speech) > 0.001:
         fallback_runner, fallback_load_seconds = get_moonshine_runner(args.model, "CPU")
         model_load_seconds += fallback_load_seconds
         text = fallback_runner.transcribe(raw_speech, args.max_new_tokens)

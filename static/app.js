@@ -26,23 +26,124 @@ const els = {
   transcript: document.querySelector("#transcript"),
   metrics: document.querySelector("#metrics"),
   deviceStatus: document.querySelector("#deviceStatus"),
+  modelChoices: document.querySelector("#modelChoices"),
+  modelInput: document.querySelector("#model"),
+  customModelInput: document.querySelector("#customModel"),
+  customModelField: document.querySelector("#customModelField"),
 };
 
 els.startLiveButton.addEventListener("click", startLive);
 els.stopLiveButton.addEventListener("click", stopLive);
 els.clearButton.addEventListener("click", clearOutput);
-document.querySelector("#model").addEventListener("input", resetWarmup);
+els.modelChoices.addEventListener("click", handleModelButtonClick);
+els.customModelInput.addEventListener("input", handleCustomModelInput);
 document.querySelector("#device").addEventListener("change", resetWarmup);
 
+updateCustomModelVisibility();
+loadModels();
 loadDevices();
+
+async function loadModels() {
+  try {
+    const response = await fetch("/api/models");
+    const data = await response.json();
+    updateModelSelect(data.models || []);
+  } catch {
+    updateModelSelect([]);
+  }
+}
+
+function updateModelSelect(models) {
+  if (!models.length) {
+    return;
+  }
+
+  const currentValue = getSelectedModel();
+  els.modelChoices.innerHTML = "";
+
+  for (const model of models) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "model-option";
+    button.dataset.model = model.value;
+    button.textContent = model.label;
+    button.title = model.description || model.value;
+    els.modelChoices.appendChild(button);
+  }
+
+  const customButton = document.createElement("button");
+  customButton.type = "button";
+  customButton.className = "model-option";
+  customButton.dataset.model = "custom";
+  customButton.textContent = "Custom";
+  customButton.title = "Custom model id or directory";
+  els.modelChoices.appendChild(customButton);
+
+  const knownModel = models.find((model) => model.value === currentValue);
+  selectModelButton(knownModel ? knownModel.value : "custom");
+  if (!knownModel) {
+    els.customModelInput.value = currentValue;
+  }
+  setSelectedModel(currentValue);
+}
+
+function handleModelButtonClick(event) {
+  const button = event.target.closest(".model-option");
+  if (!button) {
+    return;
+  }
+
+  selectModelButton(button.dataset.model);
+  if (button.dataset.model !== "custom") {
+    setSelectedModel(button.dataset.model);
+  } else {
+    setSelectedModel(els.customModelInput.value.trim());
+  }
+  loadDevices();
+  resetWarmup();
+}
+
+function handleCustomModelInput() {
+  if (getActiveModelChoice() === "custom") {
+    setSelectedModel(els.customModelInput.value.trim());
+    loadDevices();
+    resetWarmup();
+  }
+}
+
+function selectModelButton(modelValue) {
+  for (const button of els.modelChoices.querySelectorAll(".model-option")) {
+    const isActive = button.dataset.model === modelValue;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  }
+  updateCustomModelVisibility();
+}
+
+function getActiveModelChoice() {
+  return els.modelChoices.querySelector(".model-option.active")?.dataset.model || els.modelInput.value;
+}
+
+function setSelectedModel(modelValue) {
+  els.modelInput.value = modelValue;
+}
+
+function updateCustomModelVisibility() {
+  els.customModelField.classList.toggle("hidden", getActiveModelChoice() !== "custom");
+}
+
+function getSelectedModel() {
+  return els.modelInput.value.trim();
+}
 
 async function loadDevices() {
   try {
-    const response = await fetch("/api/devices");
+    const response = await fetch(`/api/devices?model=${encodeURIComponent(getSelectedModel())}`);
     const data = await response.json();
     updateDeviceSelect(data.choices || []);
+    const autoChoice = (data.choices || []).find((choice) => choice.value === "auto");
     els.deviceStatus.textContent = data.devices?.length
-      ? `Transformers: ${data.devices.join(", ")}`
+      ? `Device: ${autoChoice?.target || data.devices[0]}`
       : "Moonshine devices unavailable";
   } catch {
     els.deviceStatus.textContent = "device check failed";
@@ -58,6 +159,7 @@ function updateDeviceSelect(choices) {
     const option = document.createElement("option");
     option.value = choice.value;
     option.textContent = choice.available ? choice.label : `${choice.label} unavailable`;
+    option.title = choice.reason || choice.target || choice.label;
     option.disabled = !choice.available;
     deviceSelect.appendChild(option);
   }
@@ -82,7 +184,7 @@ async function startLive() {
     state.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     state.audioContext = new AudioContext();
     state.source = state.audioContext.createMediaStreamSource(state.stream);
-    state.processor = state.audioContext.createScriptProcessor(4096, 1, 1);
+    state.processor = state.audioContext.createScriptProcessor(2048, 1, 1);
     state.analyser = state.audioContext.createAnalyser();
     state.analyser.fftSize = 256;
     state.chunks = [];
@@ -123,7 +225,7 @@ async function warmupModel() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: document.querySelector("#model").value.trim(),
+      model: getSelectedModel(),
       device: document.querySelector("#device").value,
     }),
   });
@@ -146,8 +248,15 @@ function formatWarmupDevice(data) {
 function resetWarmup() {
   state.warmed = false;
   els.warmupNotice.classList.remove("active");
-  els.warmupNotice.textContent =
-    "The first start downloads and warms up UsefulSensors/moonshine-tiny-ja. Intel GPU uses OpenVINO and saves converted model files under cache\\openvino for faster startup after restart.";
+  els.warmupNotice.textContent = warmupNoticeText();
+}
+
+function warmupNoticeText() {
+  const model = getSelectedModel();
+  if (model.includes("Qwen3-ASR")) {
+    return `The first start downloads, converts, and warms up ${model}. Intel GPU uses OpenVINO IR saved under cache\\openvino.`;
+  }
+  return `The first start downloads and warms up ${model}. Intel GPU uses OpenVINO when supported and saves converted model files under cache\\openvino for faster startup after restart.`;
 }
 
 async function stopLive() {
@@ -204,6 +313,10 @@ async function flushLiveChunk() {
   state.chunkIndex = chunkNumber;
   const merged = mergeFloat32(chunks);
   const resampled = resampleLinear(merged, state.audioContext.sampleRate, 16000);
+  if (audioRms(resampled) < 0.003) {
+    els.liveLog.textContent = state.liveRunning ? "listening" : "stopped";
+    return;
+  }
   const wav = encodeWav(resampled, 16000);
   const blob = new Blob([wav], { type: "audio/wav" });
 
@@ -237,7 +350,7 @@ async function submitAudio(blob, filename, options = {}) {
 
 function buildFormData() {
   const formData = new FormData();
-  formData.append("model", document.querySelector("#model").value.trim());
+  formData.append("model", getSelectedModel());
   formData.append("device", document.querySelector("#device").value);
   formData.append("max_new_tokens", document.querySelector("#maxTokens").value);
   formData.append("duration", document.querySelector("#duration").value);
@@ -295,8 +408,8 @@ function setBusy(isBusy, status) {
 }
 
 function getChunkMs() {
-  const seconds = Number(document.querySelector("#duration").value || 4);
-  return Math.max(1000, seconds * 1000);
+  const seconds = Number(document.querySelector("#duration").value || 1);
+  return Math.max(500, seconds * 1000);
 }
 
 function mergeFloat32(chunks) {
@@ -325,6 +438,17 @@ function resampleLinear(input, fromRate, toRate) {
     output[i] = input[before] * (1 - weight) + input[after] * weight;
   }
   return output;
+}
+
+function audioRms(samples) {
+  if (!samples.length) {
+    return 0;
+  }
+  let squareSum = 0;
+  for (const sample of samples) {
+    squareSum += sample * sample;
+  }
+  return Math.sqrt(squareSum / samples.length);
 }
 
 function encodeWav(samples, sampleRate) {

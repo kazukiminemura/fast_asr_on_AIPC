@@ -1,6 +1,6 @@
 # fast_asr_on_AIPC
 
-Raptor mini (Preview) などの AIPC 上で、`UsefulSensors/moonshine-tiny-ja` を使って日本語音声認識を行うブラウザGUIアプリです。
+Raptor mini (Preview) などの AIPC 上で、`neosophie/Qwen3-ASR-1.7B-JA` を使って日本語音声認識を行うブラウザGUIアプリです。
 
 ブラウザのマイク入力を短い音声チャンクに分けて継続処理し、文字起こし結果と RTF を画面に追記します。最初の開始時は Hugging Face からモデルを取得してウォームアップするため時間がかかります。ウォームアップ後はメモリ上のモデルを再利用し、モデルファイルも `cache\huggingface` に残して次回起動を速くします。
 
@@ -9,7 +9,7 @@ Raptor mini (Preview) などの AIPC 上で、`UsefulSensors/moonshine-tiny-ja` 
 ## Features
 
 - ブラウザGUIで操作
-- `UsefulSensors/moonshine-tiny-ja` による日本語ASR
+- `neosophie/Qwen3-ASR-1.7B-JA` による日本語ASR
 - Intel GPU 実行: OpenVINO / Optimum Intel
 - ブラウザのリアルタイムマイク入力
 - チャンク単位の継続文字起こし
@@ -31,7 +31,7 @@ pip install -r requirements.txt
 既定モデルは Hugging Face の以下です。
 
 ```text
-UsefulSensors/moonshine-tiny-ja
+neosophie/Qwen3-ASR-1.7B-JA
 ```
 
 初回実行時に自動でダウンロードされ、`cache\huggingface` に保存されます。GUI の `Model` 欄には Hugging Face model id またはローカルモデルディレクトリを指定できます。
@@ -56,7 +56,7 @@ python web_app.py --port 8080
 
 ## GUI Usage
 
-1. `Model` が `UsefulSensors/moonshine-tiny-ja` になっていることを確認する
+1. `Model` が `neosophie/Qwen3-ASR-1.7B-JA` になっていることを確認する
 2. `Device` で `auto`, `intel_gpu`, `cpu`, `gpu` を選ぶ
 3. `Max tokens` と `Chunk seconds` を調整する
 4. `Start Live` を押す
@@ -75,13 +75,13 @@ GUI と同じ Moonshine 処理を CLI からも実行できます。
 マイク録音:
 
 ```powershell
-python main.py --device auto --model UsefulSensors/moonshine-tiny-ja --mic --duration 5 --benchmark
+python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark
 ```
 
 JSON 出力:
 
 ```powershell
-python main.py --device auto --model UsefulSensors/moonshine-tiny-ja --mic --duration 5 --benchmark --json
+python main.py --device auto --model neosophie/Qwen3-ASR-1.7B-JA --mic --duration 5 --benchmark --json
 ```
 
 ## Device Policy

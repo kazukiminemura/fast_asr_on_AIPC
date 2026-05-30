@@ -93,7 +93,7 @@ h2 {
 
 .form-grid {
   display: grid;
-  grid-template-columns: 2fr repeat(5, minmax(120px, 1fr));
+  grid-template-columns: minmax(520px, 2fr) repeat(3, minmax(150px, 1fr));
   gap: 12px;
   align-items: end;
 }
@@ -117,6 +117,33 @@ h2 {
   background: #fff;
   color: var(--ink);
   padding: 8px 10px;
+}
+
+.model-buttons {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.model-option {
+  min-height: 42px;
+  font-size: 15px;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.model-option.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.model-option.active:hover {
+  background: var(--accent-strong);
+}
+
+.hidden {
+  display: none;
 }
 
 .toggle {
@@ -287,8 +314,17 @@ audio {
   color: var(--warning);
 }
 
+@media (max-width: 1100px) {
+  .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .wide {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 900px) {
-  .form-grid,
   .workspace {
     grid-template-columns: 1fr;
   }
@@ -298,6 +334,10 @@ audio {
   }
 
   .metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .model-buttons {
     grid-template-columns: 1fr;
   }
 }
