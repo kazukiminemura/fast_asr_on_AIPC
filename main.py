@@ -33,6 +33,7 @@ DEVICE_ALIASES = {
     "cpu": "CPU",
 }
 RUNNER_CACHE: dict[tuple[str, str], Any] = {}
+AVAILABLE_DEVICES_CACHE: list[str] | None = None
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -316,7 +317,11 @@ def require_dependency(module_name: str, package_name: str) -> Any:
         ) from exc
 
 
-def available_devices() -> list[str]:
+def available_devices(refresh: bool = False) -> list[str]:
+    global AVAILABLE_DEVICES_CACHE
+    if AVAILABLE_DEVICES_CACHE is not None and not refresh:
+        return list(AVAILABLE_DEVICES_CACHE)
+
     devices = ["CPU"]
     try:
         openvino = require_dependency("openvino", "openvino")
@@ -328,7 +333,8 @@ def available_devices() -> list[str]:
             devices.insert(insert_at, "OPENVINO_GPU")
     except SystemExit:
         pass
-    return devices
+    AVAILABLE_DEVICES_CACHE = devices
+    return list(devices)
 
 
 def auto_device_target(devices: list[str]) -> str:
@@ -538,13 +544,6 @@ def warmup_asr_model(model_ref: str, requested_device: str) -> dict[str, Any]:
 def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     validate_inputs(args.model, args.audio)
 
-    device_start = time.perf_counter()
-    devices = available_devices()
-    selected_device = select_model_device(args.model, args.device, devices)
-    device_selection_seconds = time.perf_counter() - device_start
-
-    runner, model_load_seconds = get_moonshine_runner(args.model, selected_device)
-
     preprocess_start = time.perf_counter()
     if args.mic:
         raw_speech, duration_seconds = read_microphone_16khz(args.duration, args.input_device)
@@ -554,13 +553,42 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
         input_source = str(args.audio)
     audio_preprocess_seconds = time.perf_counter() - preprocess_start
 
+    return run_asr_samples(
+        model_ref=args.model,
+        requested_device=args.device,
+        raw_speech=raw_speech,
+        duration_seconds=duration_seconds,
+        input_source=input_source,
+        max_new_tokens=args.max_new_tokens,
+        audio_preprocess_seconds=audio_preprocess_seconds,
+    )
+
+
+def run_asr_samples(
+    model_ref: str,
+    requested_device: str,
+    raw_speech: list[float],
+    duration_seconds: float,
+    input_source: str,
+    max_new_tokens: int,
+    audio_preprocess_seconds: float = 0.0,
+) -> tuple[dict[str, Any], BenchmarkResult]:
+    validate_inputs(model_ref, None)
+
+    device_start = time.perf_counter()
+    devices = available_devices()
+    selected_device = select_model_device(model_ref, requested_device, devices)
+    device_selection_seconds = time.perf_counter() - device_start
+
+    runner, model_load_seconds = get_moonshine_runner(model_ref, selected_device)
+
     inference_start = time.perf_counter()
-    text = runner.transcribe(raw_speech, args.max_new_tokens)
+    text = runner.transcribe(raw_speech, max_new_tokens)
     fallback_device = None
-    if not is_qwen3_asr_model(args.model) and is_openvino_device(selected_device) and not text and audio_rms(raw_speech) > 0.001:
-        fallback_runner, fallback_load_seconds = get_moonshine_runner(args.model, "CPU")
+    if not is_qwen3_asr_model(model_ref) and is_openvino_device(selected_device) and not text and audio_rms(raw_speech) > 0.001:
+        fallback_runner, fallback_load_seconds = get_moonshine_runner(model_ref, "CPU")
         model_load_seconds += fallback_load_seconds
-        text = fallback_runner.transcribe(raw_speech, args.max_new_tokens)
+        text = fallback_runner.transcribe(raw_speech, max_new_tokens)
         fallback_device = "CPU"
     inference_seconds = time.perf_counter() - inference_start
 
@@ -590,8 +618,8 @@ def run_asr(args: argparse.Namespace) -> tuple[dict[str, Any], BenchmarkResult]:
     payload = {
         "text": text,
         "chunks": [],
-        "model": args.model,
-        "requested_device": args.device,
+        "model": model_ref,
+        "requested_device": requested_device,
         "selected_device": selected_device,
         "fallback_device": fallback_device,
         "available_devices": devices,

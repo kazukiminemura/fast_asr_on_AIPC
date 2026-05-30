@@ -20,10 +20,10 @@ const state = {
 const chunking = {
   speechRmsThreshold: 0.01,
   submitRmsThreshold: 0.003,
-  minChunkMs: 700,
-  trailingSilenceMs: 650,
-  maxChunkMs: 7000,
-  idleDropMs: 2000,
+  minChunkMs: 350,
+  trailingSilenceMs: 280,
+  maxChunkMs: 2400,
+  idleDropMs: 900,
 };
 
 const els = {
@@ -100,7 +100,7 @@ async function startLive() {
     state.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     state.audioContext = new AudioContext();
     state.source = state.audioContext.createMediaStreamSource(state.stream);
-    state.processor = state.audioContext.createScriptProcessor(2048, 1, 1);
+    state.processor = state.audioContext.createScriptProcessor(1024, 1, 1);
     state.analyser = state.audioContext.createAnalyser();
     state.analyser.fftSize = 256;
     resetChunkState();

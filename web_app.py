@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
-import tempfile
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from main import DEFAULT_MODEL, available_devices, device_choices, model_choices, run_asr, warmup_asr_model
+from main import (
+    DEFAULT_MODEL,
+    available_devices,
+    device_choices,
+    model_choices,
+    require_dependency,
+    run_asr_samples,
+    warmup_asr_model,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -170,27 +178,31 @@ def transcribe_form(
     if not audio_file or not audio_file[1]:
         raise ValueError("Audio input is required.")
 
-    suffix = Path(audio_file[0]).suffix or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
-        temp_audio.write(audio_file[1])
-        temp_audio_path = Path(temp_audio.name)
+    raw_speech, duration_seconds = read_audio_upload_16khz(audio_file[1])
+    payload, _benchmark = run_asr_samples(
+        model_ref=model,
+        requested_device=fields.get("device", "auto"),
+        raw_speech=raw_speech,
+        duration_seconds=duration_seconds,
+        input_source=audio_file[0],
+        max_new_tokens=64,
+    )
+    return payload
 
-    try:
-        args = argparse.Namespace(
-            device=fields.get("device", "auto"),
-            model=model,
-            audio=temp_audio_path,
-            mic=False,
-            duration=float(fields.get("duration", "0") or "0"),
-            input_device=None,
-            benchmark=True,
-            json=True,
-            max_new_tokens=64,
-        )
-        payload, _benchmark = run_asr(args)
-        return payload
-    finally:
-        temp_audio_path.unlink(missing_ok=True)
+
+def read_audio_upload_16khz(audio_bytes: bytes) -> tuple[list[float], float]:
+    soundfile = require_dependency("soundfile", "soundfile")
+    numpy = require_dependency("numpy", "numpy")
+    audio, sample_rate = soundfile.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    if sample_rate != 16000:
+        librosa = require_dependency("librosa", "librosa")
+        audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
+        sample_rate = 16000
+    audio = numpy.asarray(audio, dtype="float32")
+    duration_seconds = float(len(audio) / sample_rate) if sample_rate else 0.0
+    return audio.tolist(), duration_seconds
 
 
 def parse_args() -> argparse.Namespace:
